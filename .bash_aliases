@@ -5,7 +5,7 @@
 # Enable color on coreutils
 alias ls="ls --color=auto"
 alias diff="diff --color"
-alias grep="grep --line-number --colour --binary-files=without=match"
+alias grep="grep --line-number --colour --binary-files=without-match"
 
 alias scp="scp -F ~/.ssh/config"
 alias journalclean="journalctl --vacuum-time=2d"
