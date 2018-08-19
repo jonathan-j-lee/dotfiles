@@ -1,0 +1,6 @@
+[Unit]
+Description=Rootkit scanner
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rkhunter --cronjob --propupd --report-warnings-only
