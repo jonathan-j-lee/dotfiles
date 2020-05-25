@@ -107,8 +107,7 @@ alias mv="mv -i"
 alias cp="cp -i"
 alias alert='notify-send --urgency=low -i "$([ $? = 0 ] && echo terminal || echo error)" "$(history|tail -n1|sed -e '\''s/^\s*[0-9]\+\s*//;s/[;&|]\s*alert$//'\'')"'
 
-# Add RVM to PATH for scripting. Make sure this is the last PATH variable change.
-export PATH="$PATH:$HOME/.rvm/bin"
+export PATH="$PATH:$HOME/.local/bin"
 
 export JAVA_HOME="/usr/lib/jvm/default"
 source /usr/share/nvm/init-nvm.sh
@@ -116,3 +115,5 @@ source /usr/share/nvm/init-nvm.sh
 eval "$(rbenv init -)"
 eval "$(pyenv init -)"
 eval "$(pyenv virtualenv-init -)"
+
+[ -f ~/.less_env ] && source ~/.less_env
