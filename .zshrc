@@ -89,12 +89,8 @@ source $ZSH/oh-my-zsh.sh
 # You may need to manually set your language environment
 export LANG=en_US.UTF-8
 
-# Preferred editor for local and remote sessions
-# if [[ -n $SSH_CONNECTION ]]; then
-#   export EDITOR='vim'
-# else
-#   export EDITOR='mvim'
-# fi
+# Preferred editor
+export EDITOR='vim'
 
 # Compilation flags
 # export ARCHFLAGS="-arch x86_64"
@@ -103,9 +99,22 @@ export LANG=en_US.UTF-8
 # plugins, and themes. Aliases can be placed here, though oh-my-zsh
 # users are encouraged to define aliases within the ZSH_CUSTOM folder.
 # For a full list of active aliases, run `alias`.
+
+alias diff='diff -u --color'
 alias mv="mv -i"
 alias cp="cp -i"
+alias grep="--line-number --colour --binary-files=without-match"
+
+# Power information
+alias battery="upower -i /org/freedesktop/UPower/devices/battery_BAT0"
+alias pwr="acpi"
+alias temp="acpi -tf"
+
+alias ports="ss -lnptu"
+alias nfiles="ls -1A | wc -l"  # Count number of files (includes hidden files)
+alias rmd5sum="find $1 -type f -print0 | xargs -0 md5sum"  # Recursive md5sum
 alias alert='notify-send --urgency=low -i "$([ $? = 0 ] && echo terminal || echo error)" "$(history|tail -n1|sed -e '\''s/^\s*[0-9]\+\s*//;s/[;&|]\s*alert$//'\'')"'
+alias sl="sl -a"
 
 export PATH="$PATH:$HOME/.local/bin"
 
@@ -113,7 +122,11 @@ export JAVA_HOME="/usr/lib/jvm/default"
 source /usr/share/nvm/init-nvm.sh
 
 eval "$(rbenv init -)"
-eval "$(pyenv init -)"
-eval "$(pyenv virtualenv-init -)"
+
+# eval "$(pyenv init -)"
+# eval "$(pyenv virtualenv-init -)"
+export PIPENV_HIDE_EMOJIS=yes
 
 [ -f ~/.less_env ] && source ~/.less_env
+
+archey3
