@@ -1,6 +1,6 @@
 " .vimrc
 
-colorscheme hybrid
+colorscheme iceberg
 set background=dark
 syntax enable
 
@@ -16,20 +16,14 @@ set autoindent
 set wildmenu
 set lazyredraw
 set showmatch   " Highlight search matches
+set viminfo=    " Disable .viminfo
 
 filetype plugin indent on
 
 set incsearch
 set hlsearch
 
-" Disable swap files
-set noswapfile
-
 autocmd BufWritePre * :%s/\s\+$//e
-
-set backup
-set backupdir=/tmp
-set writebackup
 
 if has("autocmd")
   au BufReadPost * if line("'\"") > 0 && line("'\"") <= line("$") | exe "normal! g`\"" | endif

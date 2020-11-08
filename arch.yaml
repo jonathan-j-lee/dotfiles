@@ -1,0 +1,34 @@
+---
+- name: provision Workstation
+  hosts: localhost
+  connection: local
+  vars_prompt:
+    - name: first_name
+      prompt: First name
+      private: no
+    - name: last_name
+      prompt: Last name
+      private: no
+    - name: email
+      prompt: Email
+      private: no
+    - name: signing_key
+      prompt: Signing key
+      private: no
+  tasks:
+    - name: copy zshrc
+      copy:
+        src: conf/zshrc
+        dest: "{{ ansible_env.HOME }}/.zshrc"
+    - name: copy vimrc
+      copy:
+        src: conf/vimrc
+        dest: "{{ ansible_env.HOME }}/.vimrc"
+    - name: copy wgetrc
+      copy:
+        src: conf/wgetrc
+        dest: "{{ ansible_env.HOME }}/.wgetrc"
+    # - name: copy gitconfig
+    #   template:
+    #     src: conf/gitconfig
+    #     dest: "{{ asnible_env.HOME }}/.gitconfig"

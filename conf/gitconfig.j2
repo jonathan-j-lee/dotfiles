@@ -1,0 +1,22 @@
+[color]
+  ui = auto
+
+[user]
+  name = {{ first_name }} {{ last_name }}
+  email = {{ email }}
+  signingkey = {{ signing_key }}
+
+[core]
+  editor = vim
+
+[alias]
+  graph = log --graph --oneline --all
+  update = fetch --all --prune
+  namediff = diff --name-only
+  delta = diff --stat HEAD~1
+
+[filter "lfs"]
+  clean = git-lfs clean -- %f
+  smudge = git-lfs smudge -- %f
+  process = git-lfs filter-process
+  required = true

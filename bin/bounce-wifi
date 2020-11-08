@@ -7,7 +7,11 @@
 #
 # This script reloads a wifi-related kernel module.
 
-MODULE=brcmfmac
-modprobe -r ${MODULE}
-modprobe ${MODULE}
+kernel_version=$(ls -1 /lib/modules | tail -1)
+echo "Kernel version: ${kernel_version}"
+
+module=brcmfmac
+set -x
+modprobe -r ${module}
+modprobe -S ${kernel_version} ${module}
 systemctl restart NetworkManager.service
