@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
+import collections
 import contextlib
 import dataclasses
 import datetime
 import enum
 import functools
+import math
+import numbers
 import typing
 import re
 import warnings
@@ -271,7 +274,69 @@ def history(ctx, package):
         else:
             click.echo(' '*2, nl=False)
             click.secho('No versions found.', fg='red', bold=True)
-        click.echo('')
+        click.echo()
+
+
+def display_histogram(title: str, labels: typing.Iterable[str],
+                      counts: typing.Iterable[numbers.Real], width: int = 100,
+                      padding: int = 2, symbol: str = '='):
+    click.secho(title, bold=True)
+    label_width, max_count, count_total = max(map(len, labels)), max(counts), sum(counts)
+    for label, count in zip(labels, counts):
+        click.echo(' '*padding, nl=False)
+        click.secho(label.rjust(label_width), bold=True, nl=False)
+        click.echo(' '*padding, nl=False)
+        click.secho('{:.2f}%'.format(100*count/count_total).rjust(7), nl=False)
+        click.echo(' '*padding, nl=False)
+        click.secho('|' + symbol*int(width*count/max_count))
+    click.echo()
+
+
+Interval, IntegralInterval = typing.Tuple[numbers.Real, numbers.Real], typing.Tuple[int, int]
+
+
+def bin_count(values: typing.Sequence[numbers.Real],
+              intervals: typing.Sequence[Interval]) -> typing.Sequence[int]:
+    counts = [0]*len(intervals)
+    for value in values:
+        for i, (lower, upper) in enumerate(intervals):
+            if lower <= value < upper:
+                counts[i] += 1
+                break
+    return counts
+
+
+def intervals_to_labels(intervals: typing.Sequence[IntegralInterval]) -> typing.Iterable[str]:
+    for lower, upper in intervals:
+        if math.isinf(upper) and upper > 0:
+            yield f'{lower}+'
+        else:
+            yield f'{lower} - {upper-1}'
+
+
+@cli.command()
+@click.pass_context
+def stats(ctx):
+    """ Display usage statistics. """
+    operations = ctx.obj['operations']
+
+    pkg_counts = [len(operation.packages) for operation in operations
+                  if operation.complete and operation.packages]
+    breakpoints = list(range(1, 30, 2)) + [float('inf')]
+    intervals = list(zip(breakpoints[:-1], breakpoints[1:]))
+    counts = bin_count(pkg_counts, intervals)
+    display_histogram(f'Package Count per Transaction (max: {max(pkg_counts)}, '
+                      f'mean: {round(sum(pkg_counts)/len(pkg_counts), 2)})',
+                      list(intervals_to_labels(intervals)), counts)
+
+    op_times = [min(pkg.timestamp for pkg in operation.packages.values())
+                for operation in operations if operation.packages]
+    op_hour_hist = collections.Counter([op_time.hour for op_time in op_times])
+    labels, counts = [], []
+    for hour in range(0, 24):
+        labels.append(datetime.time(hour=hour).strftime('%I %p'))
+        counts.append(op_hour_hist.get(hour, 0))
+    display_histogram('Operation Start by Time of Day', labels, counts)
 
 
 if __name__ == '__main__':
