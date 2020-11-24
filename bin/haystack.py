@@ -14,6 +14,8 @@ import warnings
 
 import click
 
+EPOCH = datetime.datetime.fromtimestamp(0)
+
 
 class LogSource(enum.Enum):
     PACMAN = 'PACMAN'
@@ -105,6 +107,14 @@ class PackageAction(enum.Enum):
     DOWNGRADE = 'downgraded'
     REMOVE = 'removed'
 
+PackageAction.COLORS = {
+    PackageAction.INSTALL: 'green',
+    PackageAction.REINSTALL: 'yellow',
+    PackageAction.UPGRADE: 'cyan',
+    PackageAction.DOWNGRADE: 'magenta',
+    PackageAction.REMOVE: 'red',
+}
+
 
 @dataclasses.dataclass(frozen=True)
 class PackageVersion:
@@ -133,6 +143,10 @@ class Operation:
     @functools.cached_property
     def duration(self) -> datetime.timedelta:
         return self.end - self.start
+
+    @property
+    def chronological_packages(self) -> typing.Iterable[str]:
+        return sorted(self.packages, key=lambda pkg: self.packages[pkg].timestamp)
 
 
 class OperationBuffer(list):
@@ -177,10 +191,11 @@ class OperationBuffer(list):
                 action, package, version = record.message.split(maxsplit=2)
                 if not (match := self.VERSION_PATTERN.match(version)):
                     raise ValueError(f'Unable to read version number: {record.message!r}')
+                action = PackageAction(action)
                 self.last_pkg_or_hook = operation.packages[package] = PackageVersion(
                     record.timestamp,
-                    match.group('version'),
-                    PackageAction(action),
+                    match.group('version') if action is not PackageAction.REMOVE else None,
+                    action,
                     list(self.warning_buffer),
                 )
                 self.warning_buffer.clear()
@@ -208,11 +223,24 @@ class OperationBuffer(list):
                 warnings.warn('Log record before any operations.')
         self.reset()
 
-    def get_versions(self, package: str) -> typing.Iterable[PackageVersion]:
+    def get_versions_by_package(self, package: str) -> typing.Iterable[PackageVersion]:
         for operation in self:
             version = operation.packages.get(package)
             if version:
                 yield version
+
+    def get_diff(self, after: datetime.datetime, before: datetime.datetime = EPOCH) \
+            -> typing.MutableMapping[str, typing.Sequence[PackageVersion]]:
+        packages = collections.defaultdict(list)
+        before, after = before.timestamp(), after.timestamp()
+        for operation in self:
+            for package in operation.chronological_packages:
+                version = operation.packages[package]
+                if (timestamp := version.timestamp.timestamp()) > after:
+                    return packages
+                if before <= timestamp:
+                    packages[package].append(version)
+        return packages
 
 
 @click.group()
@@ -230,51 +258,128 @@ def cli(ctx, log: str):
             records = LogRecord.from_file(log_file)
     except ValueError as exc:
         raise click.ClickException(f'Corrupt log {log!r}') from exc
-    click.secho(f':: Read {len(records)} records from {log!r}', fg='cyan')
-
     ctx.obj['operations'] = operations = OperationBuffer()
     operations.parse(records)
-    click.secho(f':: Parsed {len(operations)} operations', fg='cyan')
 
 
-@cli.command('list')
-@click.pass_context
-def list_transactions(ctx):
-    """ List transactions. """
+def parse_timestamp(ctx, timestamp: typing.Union[str, datetime.datetime]) -> datetime.datetime:
+    if isinstance(timestamp, datetime.datetime):
+        return timestamp
+    try:
+        return LogRecord.parse_timestamp(timestamp)
+    except ValueError as exc:
+        raise click.BadParameter(f'Unable to parse timestamp: {timestamp}') from exc
 
 
 @cli.command()
+@click.option('--before', default=EPOCH, callback=parse_timestamp,
+              help='The time of the starting package database state.')
+@click.option('--after', default=datetime.datetime.now(), callback=parse_timestamp,
+              help='The time of the ending package database state.')
+@click.option('--intermediate/--no-intermediate',
+              help='Show all intermediate package versions, not just the net delta.')
+@click.option('--hide/--no-hide', default=True, help='Hide packages with no version change.')
+@click.pass_context
+def diff(ctx, before, after, intermediate, hide):
+    """
+    Get the change in package versions between two times.
+
+    Examples:
+
+    List all packages currently available:
+
+    \b
+      $ haystack diff
+
+    List all packages modified in the last week:
+
+    \b
+      $ haystack diff --before="$(date --date='1 week ago' +'%Y-%m-%d %H:%M')" --intermediate
+    """
+    operations = ctx.obj['operations']
+
+    base, delta = operations.get_diff(before), operations.get_diff(after, before)
+    packages = {}
+    for package, versions in delta.items():
+        base_version = base[package][-1].version if package in base else None
+        packages[package] = [base_version] + [version.version for version in versions]
+    for package, versions in base.items():
+        if package not in packages and versions[-1].action is not PackageAction.REMOVE:
+            packages[package] = [versions[-1].version]
+    if hide:
+        for package, versions in list(packages.items()):
+            if versions[0] == versions[-1]:
+                del packages[package]
+
+    package_width = max(map(len, packages))
+    click.secho(f'Packages ({LogRecord.format_timestamp(before)} '
+                f'-> {LogRecord.format_timestamp(after)})', bold=True)
+    for package in sorted(packages):
+        versions = packages[package]
+        if not intermediate and len(versions) >= 2:
+            versions = [versions[0], versions[-1]]
+        if all(version is None for version in versions):
+            continue
+        click.echo(' '*2, nl=False)
+        click.echo(package.rjust(package_width), nl=False)
+        click.echo(' '*2, nl=False)
+        if versions[0] is None and versions[-1] is not None:
+            status, color = 'installed', 'green'
+        elif versions[0] is not None and versions[-1] is None:
+            status, color = 'removed', 'red'
+        elif versions[0] == versions[-1]:
+            status, color = 'no change', 'blue'
+        else:
+            status, color = 'modified', 'cyan'
+        click.secho(status.capitalize().rjust(9), fg=color, bold=True, nl=False)
+        click.echo(' '*2, nl=False)
+        click.echo(' -> '.join(map(str, versions)), nl=False)
+        click.echo()
+
+
+@cli.command()
+@click.option('--scriptlet/--no-scriptlet', help='Show scriptlet output.')
 @click.argument('package', nargs=-1)
 @click.pass_context
-def history(ctx, package):
+def package(ctx, scriptlet, package):
     """ Get the version history of packages. """
     operations = ctx.obj['operations']
-    action_colors = {
-        PackageAction.INSTALL: 'green',
-        PackageAction.REINSTALL: 'yellow',
-        PackageAction.UPGRADE: 'cyan',
-        PackageAction.DOWNGRADE: 'magenta',
-        PackageAction.REMOVE: 'red',
-    }
 
     for pkg in package:
         click.secho(f'Package: {pkg}\n', bold=True)
-        versions = list(operations.get_versions(pkg))
+        versions = list(operations.get_versions_by_package(pkg))
         if versions:
             current_version = None
             for version in versions:
                 click.echo(LogRecord.format_timestamp(version.timestamp).rjust(26), nl=False)
                 click.echo(' '*2, nl=False)
                 click.secho(version.action.name.capitalize().rjust(9),
-                            fg=action_colors[version.action], bold=True, nl=False)
+                            fg=PackageAction.COLORS[version.action], bold=True, nl=False)
                 click.echo(' '*2, nl=False)
-                next_version = None if version.action is PackageAction.REMOVE else version.version
+                next_version = version.version
                 click.secho(f'{current_version} -> {next_version}')
                 current_version = next_version
+
+                if scriptlet and version.scriptlet:
+                    click.echo()
+                    for line in version.scriptlet:
+                        click.echo(' '*10 + '| ', nl=False)
+                        click.secho(line, fg='blue', bold=True)
+                    click.echo()
         else:
             click.echo(' '*2, nl=False)
             click.secho('No versions found.', fg='red', bold=True)
         click.echo()
+
+
+@click.command()
+def operation():
+    pass
+
+
+@click.command()
+def query():
+    pass
 
 
 def display_histogram(title: str, labels: typing.Iterable[str],
