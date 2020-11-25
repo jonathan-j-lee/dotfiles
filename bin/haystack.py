@@ -15,6 +15,9 @@ import warnings
 import click
 
 EPOCH = datetime.datetime.fromtimestamp(0)
+SCRIPTLET_STYLE = dict(fg='blue', bold=True)
+WARNING_STYLE = dict(fg='red', bold=True)
+MATCH_STYLE = dict(fg='green', bold=True)
 
 
 class LogSource(enum.Enum):
@@ -46,16 +49,17 @@ class LogRecord:
     NAIVE_TIMESTAMP_FORMAT = '%Y-%m-%d %H:%M'
     AWARE_TIMESTAMP_FORMAT = '%Y-%m-%dT%H:%M:%S%z'
 
-    def append(self, line: str, delimeter: str = '\n') -> 'LogRecord':
+    def append(self, line: str, delimeter: str = ' ') -> 'LogRecord':
         return LogRecord(self.timestamp, self.source, self.message + delimeter + line)
 
     @classmethod
-    def format_timestamp(cls, timestamp: datetime.datetime) -> str:
+    def format_timestamp(cls, timestamp: datetime.datetime, justify: int = 24) -> str:
         aware = timestamp.tzinfo is not None and timestamp.tzinfo.utcoffset(timestamp) is not None
-        return timestamp.strftime(cls.AWARE_TIMESTAMP_FORMAT if aware else cls.NAIVE_TIMESTAMP_FORMAT)
+        fmt = cls.AWARE_TIMESTAMP_FORMAT if aware else cls.NAIVE_TIMESTAMP_FORMAT
+        return timestamp.strftime(fmt).rjust(justify)
 
     def __str__(self) -> str:
-        return f'[{self.format_timestamp(self.timestamp)}] [{self.source.value}] {self.message}'
+        return f'[{self.format_timestamp(self.timestamp, 0)}] [{self.source.value}] {self.message}'
 
     @classmethod
     def parse_timestamp(cls, timestamp: str) -> datetime.datetime:
@@ -84,10 +88,10 @@ class LogRecord:
                 records.append(LogRecord(
                     cls.parse_timestamp(timestamp),
                     LogSource(source),
-                    message,
+                    message.strip(),
                 ))
             elif records:
-                records[-1] = records[-1].append(line)
+                records[-1] = records[-1].append(line.strip())
             else:
                 raise ValueError
         return records
@@ -107,6 +111,12 @@ class PackageAction(enum.Enum):
     DOWNGRADE = 'downgraded'
     REMOVE = 'removed'
 
+    def format_name(self, justify: typing.Optional[int] = None) -> str:
+        justify = self._MAX_WIDTH if justify is None else justify
+        return click.style(self.value.capitalize().rjust(justify),
+                           fg=self.COLORS[self], bold=True)
+
+PackageAction._MAX_WIDTH = max(len(action.value) for action in PackageAction)
 PackageAction.COLORS = {
     PackageAction.INSTALL: 'green',
     PackageAction.REINSTALL: 'yellow',
@@ -213,8 +223,7 @@ class OperationBuffer(list):
 
     def parse(self, records: typing.List[LogRecord]):
         for record in records:
-            match = self.COMMAND_PATTERN.match(record.message)
-            if match:
+            if (match := self.COMMAND_PATTERN.match(record.message)):
                 self.append(Operation(match.group('command')))
                 self.reset()
             elif self:
@@ -229,22 +238,22 @@ class OperationBuffer(list):
             if version:
                 yield version
 
-    def get_diff(self, after: datetime.datetime, before: datetime.datetime = EPOCH) \
+    def get_diff(self, end: datetime.datetime, start: datetime.datetime = EPOCH) \
             -> typing.MutableMapping[str, typing.Sequence[PackageVersion]]:
         packages = collections.defaultdict(list)
-        before, after = before.timestamp(), after.timestamp()
+        start, end = start.timestamp(), end.timestamp()
         for operation in self:
             for package in operation.chronological_packages:
                 version = operation.packages[package]
-                if (timestamp := version.timestamp.timestamp()) > after:
+                if (timestamp := version.timestamp.timestamp()) > end:
                     return packages
-                if before <= timestamp:
+                if start <= timestamp:
                     packages[package].append(version)
         return packages
 
 
-@click.group()
-@click.option('--log', default='/var/log/pacman.log',
+@click.group(context_settings={'max_content_width': 120})
+@click.option('--log', default='/var/log/pacman.log', show_default=True,
               type=click.Path(exists=True, dir_okay=False), help='Log file location.')
 @click.version_option(version='0.0.1', message='v%(version)s')
 @click.pass_context
@@ -271,16 +280,39 @@ def parse_timestamp(ctx, timestamp: typing.Union[str, datetime.datetime]) -> dat
         raise click.BadParameter(f'Unable to parse timestamp: {timestamp}') from exc
 
 
+def parse_actions(ctx, actions: str) -> typing.Set[PackageAction]:
+    try:
+        return {PackageAction(action.strip().lower()) for action in actions.split(',')}
+    except ValueError as exc:
+        raise click.BadParameter(f'Unable to parse actions: {actions!r}') from exc
+
+
+def compile_pattern(ctx, pattern: typing.Optional[str]) -> typing.Optional[re.Pattern]:
+    if not pattern:
+        return
+    try:
+        return re.compile(pattern)
+    except re.error as exc:
+        raise click.BadParameter(f'Unable to compile regex pattern: {pattern!r}') from exc
+
+
+def display_block(lines: typing.Iterable[str], indent: int = 10, prefix: str = '|'):
+    if lines:
+        for line in lines:
+            click.echo(' '*indent + prefix + ' ' + line)
+        click.echo()
+
+
 @cli.command()
-@click.option('--before', default=EPOCH, callback=parse_timestamp,
-              help='The time of the starting package database state.')
-@click.option('--after', default=datetime.datetime.now(), callback=parse_timestamp,
-              help='The time of the ending package database state.')
+@click.option('--start', default=EPOCH, callback=parse_timestamp,
+              help='The time of the starting database state. Defaults to UNIX epoch.')
+@click.option('--end', default=datetime.datetime.now(), callback=parse_timestamp,
+              help='The time of the ending database state. Defaults to the current time.')
 @click.option('--intermediate/--no-intermediate',
               help='Show all intermediate package versions, not just the net delta.')
 @click.option('--hide/--no-hide', default=True, help='Hide packages with no version change.')
 @click.pass_context
-def diff(ctx, before, after, intermediate, hide):
+def diff(ctx, start, end, intermediate, hide):
     """
     Get the change in package versions between two times.
 
@@ -294,11 +326,11 @@ def diff(ctx, before, after, intermediate, hide):
     List all packages modified in the last week:
 
     \b
-      $ haystack diff --before="$(date --date='1 week ago' +'%Y-%m-%d %H:%M')" --intermediate
+      $ haystack diff --start="$(date --date='1 week ago' +'%Y-%m-%d %H:%M')" --intermediate
     """
     operations = ctx.obj['operations']
 
-    base, delta = operations.get_diff(before), operations.get_diff(after, before)
+    base, delta = operations.get_diff(start), operations.get_diff(end, start)
     packages = {}
     for package, versions in delta.items():
         base_version = base[package][-1].version if package in base else None
@@ -312,8 +344,8 @@ def diff(ctx, before, after, intermediate, hide):
                 del packages[package]
 
     package_width = max(map(len, packages))
-    click.secho(f'Packages ({LogRecord.format_timestamp(before)} '
-                f'-> {LogRecord.format_timestamp(after)})', bold=True)
+    click.secho(f'Packages ({LogRecord.format_timestamp(start, 0)} '
+                f'-> {LogRecord.format_timestamp(end, 0)}):\n', bold=True)
     for package in sorted(packages):
         versions = packages[package]
         if not intermediate and len(versions) >= 2:
@@ -335,6 +367,7 @@ def diff(ctx, before, after, intermediate, hide):
         click.echo(' '*2, nl=False)
         click.echo(' -> '.join(map(str, versions)), nl=False)
         click.echo()
+    click.echo()
 
 
 @cli.command()
@@ -344,42 +377,140 @@ def diff(ctx, before, after, intermediate, hide):
 def package(ctx, scriptlet, package):
     """ Get the version history of packages. """
     operations = ctx.obj['operations']
-
     for pkg in package:
         click.secho(f'Package: {pkg}\n', bold=True)
         versions = list(operations.get_versions_by_package(pkg))
         if versions:
             current_version = None
             for version in versions:
-                click.echo(LogRecord.format_timestamp(version.timestamp).rjust(26), nl=False)
                 click.echo(' '*2, nl=False)
-                click.secho(version.action.name.capitalize().rjust(9),
-                            fg=PackageAction.COLORS[version.action], bold=True, nl=False)
+                click.echo(LogRecord.format_timestamp(version.timestamp), nl=False)
+                click.echo(' '*2, nl=False)
+                click.secho(version.action.format_name(), nl=False)
                 click.echo(' '*2, nl=False)
                 next_version = version.version
                 click.secho(f'{current_version} -> {next_version}')
                 current_version = next_version
-
-                if scriptlet and version.scriptlet:
-                    click.echo()
-                    for line in version.scriptlet:
-                        click.echo(' '*10 + '| ', nl=False)
-                        click.secho(line, fg='blue', bold=True)
-                    click.echo()
+                if scriptlet:
+                    display_block([click.style(line, **SCRIPTLET_STYLE)
+                                   for line in version.scriptlet])
         else:
             click.echo(' '*2, nl=False)
             click.secho('No versions found.', fg='red', bold=True)
         click.echo()
 
 
-@click.command()
-def operation():
-    pass
+def format_matches(line: str, matches: typing.Iterable[re.Match],
+                   match_style=MATCH_STYLE, default_style=None) -> str:
+    current, buf, default_style = 0, [], default_style or {}
+    for match in matches:
+        start, end = match.start(), match.end()
+        buf.append(click.style(line[current:start], **default_style))
+        buf.append(click.style(line[start:end], **match_style))
+        current = end
+    buf.append(click.style(line[current:], **default_style))
+    return ''.join(buf)
 
 
-@click.command()
-def query():
-    pass
+def search_text(lines: typing.Sequence[str], pattern: typing.Optional[re.Pattern], **styles) \
+        -> typing.Sequence[str]:
+    if not pattern:
+        return lines
+    matches = [list(pattern.finditer(line)) for line in lines]
+    if all(not match for match in matches):
+        raise ValueError
+    return [format_matches(line, match, **styles) for line, match in zip(lines, matches)]
+
+
+@cli.command()
+@click.option('--start', default=EPOCH, callback=parse_timestamp,
+              help='Filter by minimum transaction time. Defaults to UNIX epoch.')
+@click.option('--end', default=datetime.datetime.now(), callback=parse_timestamp,
+              help='Filter by maximum transaction time. Defaults to current time.')
+@click.option('--command', callback=compile_pattern, help='Command regex pattern.')
+@click.option('--package', callback=compile_pattern, help='Package name regex pattern.')
+@click.option('--action', default=','.join(action.value for action in PackageAction),
+              callback=parse_actions, help='Comma-separated list of package actions.',
+              show_default=True)
+@click.option('--version', callback=compile_pattern, help='Version regex pattern.')
+@click.option('--scriptlet', callback=compile_pattern, help='Scriptlet output regex pattern.')
+@click.option('--warning', callback=compile_pattern, help='Warnings regex pattern.')
+@click.option('--sync/--no-sync', default=None,
+              help='Filter by whether package lists were synchronized.')
+@click.option('--upgrade/--no-upgrade', default=None,
+              help='Filter by whether a full system upgrade was run.')
+@click.option('--complete/--incomplete', default=None,
+              help='Filter by whether the transaction completed.')
+@click.pass_context
+def query(ctx, **options):
+    """
+    Query for transactions.
+
+    The boolean flags (sync, upgrade, complete) or their negatives are ignored
+    if omitted.
+
+    Examples:
+
+    Find modified packages in the GNOME group:
+
+    \b
+      $ haystack query --action=upgraded,downgraded --package='^gnome'
+
+    Find Linux 4.x packages:
+
+    \b
+      $ haystack query --version='^4\.' --package='^linux'
+
+    Find keys added or removed from the keyring:
+
+    \b
+      $ haystack query --scriptlet='(Locally signing key|Disabling key)'
+    """
+    flags = ('sync', 'upgrade', 'complete')
+    start, end = options['start'].timestamp(), options['end'].timestamp()
+    for operation in ctx.obj['operations']:
+        if any(getattr(operation, flag_name) != flag
+               for flag_name in flags if (flag := options[flag_name]) is not None):
+            continue
+
+        try:
+            command = search_text([operation.command], options['command'])[0]
+        except ValueError:
+            continue
+
+        packages = []
+        for package, version in operation.packages.items():
+            if (not start <= version.timestamp.timestamp() <= end
+                    or version.action not in options['action']):
+                # TODO: Since operations are ordered by time, we can optimize
+                #       this further by exiting early.
+                continue
+            try:
+                package = search_text([package], options['package'])[0]
+                ver_num = search_text([version.version or ''], options['version'])[0]
+                scriptlet = search_text(version.scriptlet, options['scriptlet'],
+                                        default_style=SCRIPTLET_STYLE)
+                warning = search_text(version.warning, options['warning'],
+                                      default_style=WARNING_STYLE)
+            except ValueError:
+                continue
+            packages.append((version, package, ver_num, scriptlet, warning))
+
+        if packages:
+            click.secho('Operation: ', bold=True, nl=False)
+            click.echo(command)
+            click.echo()
+            for version, package, ver_num, scriptlet, warning in packages:
+                click.echo(' '*2, nl=False)
+                click.echo(LogRecord.format_timestamp(version.timestamp), nl=False)
+                click.echo(' '*2, nl=False)
+                click.secho(version.action.format_name(), nl=False)
+                click.echo(' '*2, nl=False)
+                click.secho(f'{package} {ver_num}')
+                block = warning if options['warning'] else []
+                block += scriptlet if options['scriptlet'] else []
+                display_block(block)
+            click.echo()
 
 
 def display_histogram(title: str, labels: typing.Iterable[str],
@@ -421,7 +552,7 @@ def intervals_to_labels(intervals: typing.Sequence[IntegralInterval]) -> typing.
 
 @cli.command()
 @click.pass_context
-def stats(ctx):
+def statistics(ctx):
     """ Display usage statistics. """
     operations = ctx.obj['operations']
 
