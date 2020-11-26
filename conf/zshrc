@@ -30,7 +30,7 @@ ZSH_THEME="norm"
 # DISABLE_UPDATE_PROMPT="true"
 
 # Uncomment the following line to change how often to auto-update (in days).
-export UPDATE_ZSH_DAYS=7
+UPDATE_ZSH_DAYS=7
 
 # Uncomment the following line if pasting URLs and other text is messed up.
 # DISABLE_MAGIC_FUNCTIONS=true
@@ -70,6 +70,7 @@ export UPDATE_ZSH_DAYS=7
 # Add wisely, as too many plugins slow down shell startup.
 plugins=(
     ansible
+    colored-man-pages
     colorize
     docker
     git
@@ -80,6 +81,8 @@ plugins=(
     python
 )
 
+ZSH_COMPDUMP="${HOME}/.cache/zsh/zcompdump-${ZSH_VERSION}"
+mkdir -p "$(dirname $ZSH_COMPDUMP)"
 source $ZSH/oh-my-zsh.sh
 
 # User configuration
@@ -100,10 +103,13 @@ export EDITOR='vim'
 # users are encouraged to define aliases within the ZSH_CUSTOM folder.
 # For a full list of active aliases, run `alias`.
 
-alias diff='diff --side-by-side --color'
+alias diff='diff --color'
 alias mv="mv -i"
 alias cp="cp -i"
 alias grep="egrep --line-number --colour --binary-files=without-match"
+
+alias df='df -h'
+alias du='du -h'
 
 # Power information
 alias battery="upower -i /org/freedesktop/UPower/devices/battery_BAT0"
@@ -130,5 +136,3 @@ export PIPENV_HIDE_EMOJIS=yes
 export PIPENV_VENV_IN_PROJECT=enabled
 
 export BABEL_CACHE_PATH="$HOME/.cache/babel.json"
-
-[ -f ~/.less_env ] && source ~/.less_env

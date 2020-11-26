@@ -1,5 +1,5 @@
 ---
-- name: provision Workstation
+- name: Provision workstation
   hosts: localhost
   connection: local
   vars_prompt:
@@ -16,18 +16,22 @@
       prompt: Signing key
       private: no
   tasks:
-    - name: copy zshrc
+    - name: Make local bin
+      file:
+        path: "{{ ansible_env.HOME }}/.local/bin"
+        state: directory
+    - name: Copy *rc
       copy:
-        src: conf/zshrc
-        dest: "{{ ansible_env.HOME }}/.zshrc"
-    - name: copy vimrc
+        src: "{{ item }}"
+        dest: "{{ ansible_env.HOME }}/.{{ item | basename }}"
+        mode: u=rw,g=r,o=r
+      with_fileglob: "conf/*rc"
+    - name: Copy executables
       copy:
-        src: conf/vimrc
-        dest: "{{ ansible_env.HOME }}/.vimrc"
-    - name: copy wgetrc
-      copy:
-        src: conf/wgetrc
-        dest: "{{ ansible_env.HOME }}/.wgetrc"
+        src: "{{ item }}"
+        dest: "{{ ansible_env.HOME }}/.local/bin/{{ (item | basename | splitext)[0] }}"
+        mode: u=rwx,g=rx,o=rx
+      with_fileglob: "bin/*"
     # - name: copy gitconfig
     #   template:
     #     src: conf/gitconfig
