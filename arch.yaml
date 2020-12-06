@@ -16,22 +16,49 @@
       prompt: Signing key
       private: no
   tasks:
-    - name: Make local bin
-      file:
-        path: "{{ ansible_env.HOME }}/.local/bin"
-        state: directory
+    - name: Install user executables
+      block:
+        - name: Make user bin
+          file:
+            path: "{{ bin }}"
+            state: directory
+            mode: u=rwx,g=rx,o=rx
+        - name: Copy user executables
+          copy:
+            src: "{{ item }}"
+            dest: "{{ bin }}/{{ (item | basename | splitext)[0] }}"
+            mode: u=rwx,g=rx,o=rx
+          with_fileglob: bin/*
+      vars:
+        bin: "{{ ansible_env.HOME }}/.local/bin"
     - name: Copy *rc
       copy:
         src: "{{ item }}"
         dest: "{{ ansible_env.HOME }}/.{{ item | basename }}"
         mode: u=rw,g=r,o=r
-      with_fileglob: "conf/*rc"
-    - name: Copy executables
-      copy:
-        src: "{{ item }}"
-        dest: "{{ ansible_env.HOME }}/.local/bin/{{ (item | basename | splitext)[0] }}"
-        mode: u=rwx,g=rx,o=rx
-      with_fileglob: "bin/*"
+      with_fileglob: conf/*rc
+    - name: Disable GNOME tracker
+      block:
+        - name: Make user autostart
+          file:
+            path: "{{ autostart }}"
+            state: directory
+            mode: u=rwx,g=rx,o=rx
+        - name: Copy system autostart configs
+          copy:
+            src: "{{ item }}"
+            dest: "{{ autostart }}/{{ item | basename }}"
+            mode: u=rw,g=r,o=r
+            force: no
+          with_fileglob: /etc/xdg/autostart/tracker-*.desktop
+        - name: Ensure tracker services are hidden
+          lineinfile:
+            path: "{{ item }}"
+            regexp: '^Hidden='
+            line: Hidden=true
+          with_fileglob: "{{ autostart }}/tracker-*.desktop"
+      vars:
+        autostart: "{{ ansible_env.HOME }}/.config/autostart"
     # - name: copy gitconfig
     #   template:
     #     src: conf/gitconfig
