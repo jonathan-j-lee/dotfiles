@@ -280,9 +280,9 @@ def parse_timestamp(ctx, timestamp: typing.Union[str, datetime.datetime]) -> dat
         raise click.BadParameter(f'Unable to parse timestamp: {timestamp}') from exc
 
 
-def parse_actions(ctx, actions: str) -> typing.Set[PackageAction]:
+def parse_actions(ctx, actions: typing.Sequence[str]) -> typing.Set[PackageAction]:
     try:
-        return {PackageAction(action.strip().lower()) for action in actions.split(',')}
+        return {PackageAction(action.strip().lower()) for action in actions}
     except ValueError as exc:
         raise click.BadParameter(f'Unable to parse actions: {actions!r}') from exc
 
@@ -429,9 +429,9 @@ def search_text(lines: typing.Sequence[str], pattern: typing.Optional[re.Pattern
               help='Filter by maximum transaction time. Defaults to current time.')
 @click.option('--command', callback=compile_pattern, help='Command regex pattern.')
 @click.option('--package', callback=compile_pattern, help='Package name regex pattern.')
-@click.option('--action', default=','.join(action.value for action in PackageAction),
-              callback=parse_actions, help='Comma-separated list of package actions.',
-              show_default=True)
+@click.option('--action', default=[action.value for action in PackageAction],
+              callback=parse_actions, help='One or more package actions.',
+              show_default=True, multiple=True)
 @click.option('--version', callback=compile_pattern, help='Version regex pattern.')
 @click.option('--scriptlet', callback=compile_pattern, help='Scriptlet output regex pattern.')
 @click.option('--warning', callback=compile_pattern, help='Warnings regex pattern.')
@@ -454,7 +454,7 @@ def query(ctx, **options):
     Find modified packages in the GNOME group:
 
     \b
-      $ haystack query --action=upgraded,downgraded --package='^gnome'
+      $ haystack query --action=upgraded --action=downgraded --package='^gnome'
 
     Find Linux 4.x packages:
 

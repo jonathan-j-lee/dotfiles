@@ -136,3 +136,6 @@ export PIPENV_HIDE_EMOJIS=yes
 export PIPENV_VENV_IN_PROJECT=enabled
 
 export BABEL_CACHE_PATH="$HOME/.cache/babel.json"
+
+eval "$(_BACKUP_COMPLETE=source_zsh backup)"
+eval "$(_HAYSTACK_COMPLETE=source_zsh haystack)"
