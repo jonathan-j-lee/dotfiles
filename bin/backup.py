@@ -18,9 +18,7 @@ import re
 import click
 
 
-METADATA_NAME = '.backup'
 KIBIBYTE, MEBIBYTE, GIBIBYTE = 2**10, 2**20, 2**30
-
 as_path = lambda _ctx, path: pathlib.Path(path)
 as_paths = lambda _ctx, paths: tuple(map(pathlib.Path, paths))
 
@@ -115,9 +113,28 @@ class ProgressBar:
 
 @dataclasses.dataclass(frozen=True)
 class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
-    info: typing.Optional[tarfile.TarInfo] = None
-    digest: bytes = b''
+    """
+    A recursive data structure containing file metadata and hashes to detect changes.
+
+    The hash digest at a node is dependent on the Tar info buffer, the file
+    contents (if the node is a regular file), and the digests of all the node's
+    children (if the node is a directory). The childrens' digests are ordered
+    by name to ensure the preimage is well-defined.
+
+    Attributes:
+        digest: The hash value. May be empty.
+        children: Maps names to child files. Only nonempty for directories.
+        info: An optional `tarfile.TarInfo` containing metadata written to a
+            Tar file. May be missing because the node represents a parent
+            directory not being archived, or because the tree is deserialized.
+            Because the Tar info is used to compute the digest, this field is
+            not used for comparison.
+
+    """
+    info: typing.Optional[tarfile.TarInfo] = \
+        dataclasses.field(default=None, repr=False, compare=False)
     children: typing.MutableMapping[str, 'FileHashTree'] = dataclasses.field(default_factory=dict)
+    digest: bytes = b''
 
     ROOT: typing.ClassVar[pathlib.Path] = pathlib.Path('/')
 
@@ -195,19 +212,43 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
             elif hook:
                 hook(self.info)
         digests = [info_digest, content_digest] + [child.digest for child in children.values()]
-        return FileHashTree(self.info, digest(sep.join(digests)), children)
+        return FileHashTree(self.info, children, digest(sep.join(digests)))
 
     def __or__(self, other: typing.Optional['FileHashTree']) -> 'FileHashTree':
-        """ Merge two file hash trees. The latest (right) operand takes precedence. """
+        """
+        Merge two trees. The latest (right) operand takes precedence.
+
+        Some nodes may have blank digests because of new info/children combinations.
+        """
         if not other:
             return self
-        children = {part: child for part, child in self.children.items()
-                    if part not in other.children}
-        for part, child in other.children.items():
-            children[part] = child | self.children.get(part)
-        return FileHashTree(other.info or self.info, other.digest or self.digest, children)
+        children = {part: (self.children.get(part) | other.children.get(part))
+                    for part in set(self.children) | set(other.children)}
+        return FileHashTree(other.info or self.info, children)
 
     __ror__ = __or__
+
+    def __sub__(self, other: typing.Optional['FileHashTree']) -> typing.Optional['FileHashTree']:
+        if not other:
+            return self
+        if self.digest != other.digest:
+            children = {part: diff for part, child in self.children.items()
+                        if (diff := child - other.children.get(part))}
+            return FileHashTree(self.info, children, self.digest)
+
+    def to_dict(self) -> dict:
+        node = {'digest': self.digest.hex()}
+        if children := {part: child.to_dict() for part, child in self.children.items()}:
+            node['children'] = children
+        return node
+
+    @classmethod
+    def from_dict(cls, data) -> 'FileHashTree':
+        children = data.get('children') or {}
+        return FileHashTree(
+            children={part: cls.from_dict(child) for part, child in children.items()},
+            digest=bytes.fromhex(data.get('digest', '')),
+        )
 
 #     def create_archive(self, tar: tarfile.TarFile, bar: ProgressBar):
 #         def archive_hook(info, file_handle: typing.Optional[io.FileIO] = None):
@@ -218,28 +259,45 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
 #         self.update_hashes(archive_hook)
 
 
-def exclude():
-    pass
-
-
 @dataclasses.dataclass(frozen=True)
 class Archive:
-    DEFAULT_EXCLUDE = tuple(map(re.compile, [
-        r'^__pycache__$',
-        r'^node_modules$',
-        r'^\.cache',
-        r'^\.?(v|virtual|)envs?$',
-        r'^\.vagrant$',
+    """
+    """
+    DEFAULT_EXCLUDE = [
+        r'^__pycache__$',                               # Python
+        r'^\.?(v|virtual|)envs?$',                      # Python virtual environments
+        r'^node_modules$',                              # NodeJS
+        r'^\.cache',                                    # Caches
+        r'^\.vagrant$',                                 # Vagrant
         r'\.(aux|lof|fls|fdb_latexmk|pdfsync|toc)$',    # TeX
-        r'\.synctex(\.gz)?(\(busy\))?$',
-        r'^\.DS_Store$',
-    ]))
+        r'\.synctex(\.gz)?(\(busy\))?$',                # SyncTeX
+        r'^\.DS_Store$',                                # macOS
+    ]
 
-    tar: tarfile.TarFile
-    hashes: dict = dataclasses.field(default_factory=dict, init=False)
-    hashing_algorithm: str = 'sha256'
+    HASH_ALGORITHMS = ['sha256', 'sha384', 'sha512']
+    METADATA_DIR_NAME = '.backup'
+
+    # tar: tarfile.TarFile
+    path: pathlib.Path
+    hash_alg: str = HASH_ALGORITHMS[0]
+    exclude: typing.Sequence[re.Pattern] = dataclasses.field(default_factory=tuple)
     file_types: typing.Sequence[str] = dataclasses.field(default_factory=list)
-    exclude: typing.Sequence[re.Pattern] = dataclasses.field(default=DEFAULT_EXCLUDE)
+
+    @functools.cached_property
+    def _metadata_path(self) -> pathlib.Path:
+        return self.path / self.METADATA_DIR_NAME
+
+    def _initialize(self, name='.backup'):
+        self._metadata_path.mkdir(parents=True, exist_ok=True)
+
+    def load_backup_metadata(self):
+        pass
+
+    # def exclude(self):
+    #     pass
+    #
+    # @contextlib.contextmanager
+    # @staticmethod
 
     def should_index_special(self, info: tarfile.TarInfo) -> bool:
         return any(getattr(info, f'is{file_type}')() for file_type in self.file_types)
@@ -247,22 +305,15 @@ class Archive:
     def should_exclude(self, path: pathlib.Path) -> bool:
         return any(pattern.search(path.name) for pattern in self.exclude)
 
-    def scan(self, source: pathlib.Path) -> typing.Iterable[tarfile.TarInfo]:
-        if self.should_exclude(source):
-            return
-        info = self.tar.gettarinfo(source)
-        if not info:  # Cannot archive sockets
-            return
-        elif info.isdir():
-            yield info
-            for child in source.iterdir():
-                yield from self.scan(child)
-        elif info.isfile() or self.should_index_special(info):
-            yield info
 
-
-def filter_redundant_sources(sources: typing.Sequence[pathlib.Path]) \
+def filter_prefixes(sources: typing.Sequence[pathlib.Path]) \
         -> typing.Iterable[pathlib.Path]:
+    """
+    Filter a list of paths such that no path is a prefix of any other.
+
+    Returns:
+        The filtered paths in sorted order, coerced as absolute paths.
+    """
     if not sources:
         return
     sources = iter(sorted(source.absolute() for source in sources))
@@ -281,9 +332,8 @@ def filter_redundant_sources(sources: typing.Sequence[pathlib.Path]) \
 @click.pass_context
 def cli(ctx, **options):
     """
-    Create incremental encrypted backups.
+    Create incremental compressed backups.
     """
-    (options['archive'] / METADATA_NAME).mkdir(parents=True, exist_ok=True)
     ctx.ensure_object(dict)
     ctx.obj.update(options)
 
@@ -294,12 +344,14 @@ def cli(ctx, **options):
               help='Directories to backup.')
 @click.option('--compression', type=click.Choice(['gz', 'bz2', 'xz']),
               help='Compression method (no compression by default).')
-@click.option('--hash', default='sha256',
-              type=click.Choice(['sha256', 'sha384', 'sha512']),
+@click.option('--hash', default=Archive.HASH_ALGORITHMS[0],
+              type=click.Choice(Archive.HASH_ALGORITHMS),
               help='Hashing algorithm used to check file equality.')
 @click.option('--type', default=['sym'], show_default=True, multiple=True,
               type=click.Choice(['sym', 'lnk', 'chr', 'blk', 'fifo']),
               help='Special file types to archive.')
+@click.option('--exclude',
+              multiple=True, help='Regular expression of files to exclude.')
 @click.pass_context
 def create(ctx, **options):
     """ Create a backup. """
@@ -307,23 +359,25 @@ def create(ctx, **options):
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')
     filename = f'{timestamp}-backup.tar{"." + compression if compression else ""}'
 
-    sources = tuple(filter_redundant_sources(options['source']))
+    sources = tuple(filter_prefixes(options['source']))
     with tarfile.open(str(ctx.obj['archive'] / filename), 'w|' + compression) as tar:
+        pass
+
         root = None
         for source in sources:
             root |= FileHashTree.scan(tar, source)
         root = root.with_digests()
-        print(root.digest)
-        for x in root:
-            print(x.info)
+        print(json.dumps((root - FileHashTree.scan(tar, sources[0]).with_digests()).to_dict(), indent=2))
+
+        # print(root.digest)
+        # for x in root:
+        #     print(x.info)
         # node = root['/home/jonathanlee/uc-berkeley/2016-fall']
-        # node.update_hash_digests(hash_alg=options['hash'])
         # print(node.digest)
+        # print(json.dumps(root.to_dict(), indent=2))
+        # print(FileHashTree.from_dict(root.to_dict()) == root)
 
         # archive = Archive(tar, options['hash'], options['type'])
-        # infos = list(itertools.chain(*(archive.scan(source) for source in sources)))
-        # total_bytes = sum(info.size for info in infos)
-        # with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         #     with ProgressBar(total_bytes) as bar:
         #         archive.create(infos, bar, executor)
 
