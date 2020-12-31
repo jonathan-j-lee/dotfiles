@@ -9,6 +9,7 @@ import hashlib
 import io
 import itertools
 import json
+import operator
 import pathlib
 import queue
 import tarfile
@@ -133,7 +134,7 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
     """
     info: typing.Optional[tarfile.TarInfo] = \
         dataclasses.field(default=None, repr=False, compare=False)
-    children: typing.MutableMapping[str, 'FileHashTree'] = dataclasses.field(default_factory=dict)
+    children: dict[str, 'FileHashTree'] = dataclasses.field(default_factory=dict)
     digest: bytes = b''
 
     ROOT: typing.ClassVar[pathlib.Path] = pathlib.Path('/')
@@ -260,9 +261,7 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
 
 
 @dataclasses.dataclass(frozen=True)
-class Archive:
-    """
-    """
+class Backup:
     DEFAULT_EXCLUDE = [
         r'^__pycache__$',                               # Python
         r'^\.?(v|virtual|)envs?$',                      # Python virtual environments
@@ -273,37 +272,78 @@ class Archive:
         r'\.synctex(\.gz)?(\(busy\))?$',                # SyncTeX
         r'^\.DS_Store$',                                # macOS
     ]
+    HASH_ALGORITHMS = ('sha256', 'sha384', 'sha512')
+    TIMESTAMP_FORMAT = '%Y-%m-%dT%H%M%S'
 
-    HASH_ALGORITHMS = ['sha256', 'sha384', 'sha512']
-    METADATA_DIR_NAME = '.backup'
-
-    # tar: tarfile.TarFile
-    path: pathlib.Path
     hash_alg: str = HASH_ALGORITHMS[0]
-    exclude: typing.Sequence[re.Pattern] = dataclasses.field(default_factory=tuple)
-    file_types: typing.Sequence[str] = dataclasses.field(default_factory=list)
+    exclude: typing.Sequence[re.Pattern] = \
+        dataclasses.field(default_factory=functools.partial(list, DEFAULT_EXCLUDE))
+    file_types: set[str] = dataclasses.field(default_factory=set)
+    timestamp: datetime.datetime = dataclasses.field(
+        default_factory=lambda: datetime.datetime.utcnow().replace(microsecond=0))
+    root: typing.Optional[FileHashTree] = None
+
+    def __post_init__(self):
+        self.file_types.update({'file', 'dir'})
+
+    def should_exclude(self, path: pathlib.Path, info: tarfile.TarInfo) -> bool:
+        if any(pattern.search(path.name) for pattern in self.exclude):
+            return False
+        return not any(getattr(info, f'is{file_type}')() for file_type in self.file_types)
+
+    @functools.cached_property
+    def fmt_timestamp(self) -> str:
+        return self.timestamp.strftime(self.TIMESTAMP_FORMAT)
+
+    def to_dict(self) -> dict:
+        return {
+            'hash_alg': self.hash_alg,
+            'exclude': [pattern.pattern for pattern in self.exclude],
+            'file_types': sorted(self.file_types),
+            'timestamp': self.fmt_timestamp,
+            'root': self.root.to_dict() if self.root else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data) -> 'Backup':
+        fields = {'hash_alg': data['hash_alg']}
+        if (exclude := data.get('exclude')) is not None:
+            fields['exclude'] = tuple(map(re.compile, exclude))
+        if (file_types := data.get('file_types')) is not None:
+            fields['file_types'] = set(file_types)
+        if root := data.get('root'):
+            fields['root'] = FileHashTree.from_dict(root)
+        if timestamp := data.get('timestamp'):
+            fields['timestamp'] = datetime.datetime.strptime(timestamp, cls.TIMESTAMP_FORMAT)
+        return Backup(**fields)
+
+    # @contextlib.contextmanager
+    # @staticmethod
+
+
+@dataclasses.dataclass(frozen=True)
+class Archive:
+    path: pathlib.Path
+    metadata: list[Backup] = dataclasses.field(default_factory=list, init=False, repr=False)
+
+    METADATA_DIR_NAME = '.backup'
 
     @functools.cached_property
     def _metadata_path(self) -> pathlib.Path:
         return self.path / self.METADATA_DIR_NAME
 
-    def _initialize(self, name='.backup'):
+    def __enter__(self):
         self._metadata_path.mkdir(parents=True, exist_ok=True)
+        for path in self._metadata_path.iterdir():
+            with open(path) as metadata_file:
+                self.metadata.append(Backup.from_dict(**json.load(metadata_file)))
+        return self
 
-    def load_backup_metadata(self):
+    def __exit__(self, _exc, _exc_type, _tb):
+        self.metadata.clear()
+
+    def create(self):
         pass
-
-    # def exclude(self):
-    #     pass
-    #
-    # @contextlib.contextmanager
-    # @staticmethod
-
-    def should_index_special(self, info: tarfile.TarInfo) -> bool:
-        return any(getattr(info, f'is{file_type}')() for file_type in self.file_types)
-
-    def should_exclude(self, path: pathlib.Path) -> bool:
-        return any(pattern.search(path.name) for pattern in self.exclude)
 
 
 def filter_prefixes(sources: typing.Sequence[pathlib.Path]) \
@@ -344,13 +384,13 @@ def cli(ctx, **options):
               help='Directories to backup.')
 @click.option('--compression', type=click.Choice(['gz', 'bz2', 'xz']),
               help='Compression method (no compression by default).')
-@click.option('--hash', default=Archive.HASH_ALGORITHMS[0],
-              type=click.Choice(Archive.HASH_ALGORITHMS),
+@click.option('--hash-alg', default=Backup.HASH_ALGORITHMS[0],
+              type=click.Choice(Backup.HASH_ALGORITHMS),
               help='Hashing algorithm used to check file equality.')
 @click.option('--type', default=['sym'], show_default=True, multiple=True,
               type=click.Choice(['sym', 'lnk', 'chr', 'blk', 'fifo']),
               help='Special file types to archive.')
-@click.option('--exclude',
+@click.option('--exclude', default=Backup.DEFAULT_EXCLUDE,
               multiple=True, help='Regular expression of files to exclude.')
 @click.pass_context
 def create(ctx, **options):
@@ -359,15 +399,21 @@ def create(ctx, **options):
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')
     filename = f'{timestamp}-backup.tar{"." + compression if compression else ""}'
 
-    sources = tuple(filter_prefixes(options['source']))
-    with tarfile.open(str(ctx.obj['archive'] / filename), 'w|' + compression) as tar:
-        pass
+    with Archive(ctx.obj['archive']) as archive:
+        print(archive)
+        # print(backup := Backup.from_dict(options))
+        # print(backup == Backup.from_dict(backup.to_dict()))
 
-        root = None
-        for source in sources:
-            root |= FileHashTree.scan(tar, source)
-        root = root.with_digests()
-        print(json.dumps((root - FileHashTree.scan(tar, sources[0]).with_digests()).to_dict(), indent=2))
+    # sources = tuple(filter_prefixes(options['source']))
+    # with Backup(ctx.obj['archive'], options['hash'], options['exclude'], set(options['type'])) as archive:
+    #     print(archive)
+
+    """
+    with tarfile.open(str(ctx.obj['archive'] / filename), 'w|' + compression) as tar:
+        # trees = (FileHashTree.scan(tar, source) for source in sources)
+        # root = functools.reduce(operator.or_, trees, None)
+        # root = root.with_digests()
+        # print(json.dumps((root - FileHashTree.scan(tar, sources[0]).with_digests()).to_dict(), indent=2))
 
         # print(root.digest)
         # for x in root:
@@ -380,6 +426,7 @@ def create(ctx, **options):
         # archive = Archive(tar, options['hash'], options['type'])
         #     with ProgressBar(total_bytes) as bar:
         #         archive.create(infos, bar, executor)
+    """
 
 
 @cli.command()
