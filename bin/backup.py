@@ -30,10 +30,12 @@ class ProgressBar:
     width: int = 25
     fill_char: str = '#'
     empty_char: str = '.'
-    bytes_processed: int = dataclasses.field(default=0, init=False)
-    time_started: datetime.datetime = dataclasses.field(default=datetime.datetime.min, init=False)
-    last_update: datetime.datetime = dataclasses.field(default=datetime.datetime.min, init=False)
-    current_rate: float = 0
+    slow_rate: float = 8*MEBIBYTE  # About 0.533 GiB/min
+    medium_rate: float = 16*MEBIBYTE  # About 1.067 GiB/min
+    bytes_processed: int = dataclasses.field(default=0, init=False, repr=False)
+    time_started: datetime.datetime = dataclasses.field(default=datetime.datetime.min, init=False, repr=False)
+    last_update: datetime.datetime = dataclasses.field(default=datetime.datetime.min, init=False, repr=False)
+    current_rate: float = dataclasses.field(default=0, init=False, repr=False)
 
     RATE_DECAY: typing.ClassVar[float] = 0.9
 
@@ -68,9 +70,9 @@ class ProgressBar:
         return self.current_rate
 
     def format_rate(self, rate: float) -> str:
-        if rate < 8*MEBIBYTE:       # About 0.533 GiB/min
+        if rate < self.slow_rate:
             fg = 'red'
-        elif rate < 16*MEBIBYTE:    # About 1.067 GiB/min
+        elif rate < self.medium_rate:
             fg = 'yellow'
         else:
             fg = 'green'
@@ -103,13 +105,17 @@ class ProgressBar:
         percentage = '{:.1f}'.format(100*self.progress).rjust(5) + '%'
 
         rate = self.update_rate(info)
-        size = f' ({self.humanize_file_size(info.size)})' if info.size > 0 else ''
         filename = click.style(pathlib.Path(info.name).name, fg='cyan', bold=True)
+        if info.size > 0:
+            filename += f' ({self.humanize_file_size(info.size)})'
         click.echo(' | '.join([
             f'[{full}{empty}] {percentage}',
             f'ETA: {self.format_eta(self.eta)}, Rate: {self.format_rate(rate)}',
-            f'Archived {filename}{size}'
+            filename,
         ]) + '\r', nl=False)
+
+
+Exclude = typing.Callable[[pathlib.Path, tarfile.TarInfo], bool]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -174,16 +180,18 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
 
     @classmethod
     def scan(cls, tar: tarfile.TarFile, path: pathlib.Path,
-             base: typing.Optional[pathlib.Path] = None) -> typing.Optional['FileHashTree']:
+             base: typing.Optional[pathlib.Path] = None,
+             exclude: typing.Optional[Exclude] = None) -> typing.Optional['FileHashTree']:
         base = base or path
         with contextlib.suppress(PermissionError):
             if not path.exists() or not (info := tar.gettarinfo(path)):
                 return
-            # TODO: add exclude
+            if exclude and exclude(path, info):
+                return
             node = FileHashTree(info)
             if path.is_dir():
                 for child_path in path.iterdir():
-                    if child := FileHashTree.scan(tar, child_path, base=base):
+                    if child := FileHashTree.scan(tar, child_path, base=base, exclude=exclude):
                         node.children[child_path.name] = child
             if base == path:
                 for part in reversed(base.relative_to(cls.ROOT).parts):
@@ -251,19 +259,12 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
             digest=bytes.fromhex(data.get('digest', '')),
         )
 
-#     def create_archive(self, tar: tarfile.TarFile, bar: ProgressBar):
-#         def archive_hook(info, file_handle: typing.Optional[io.FileIO] = None):
-#             # File cache has been warmed up, so rereading should not be too slow.
-#             tar.addfile(info, file_handle)
-#             if info.size > 0:
-#                 bar.update(info)
-#         self.update_hashes(archive_hook)
 
-
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass
 class Backup:
     DEFAULT_EXCLUDE = [
         r'^__pycache__$',                               # Python
+        r'\.pyc$',                                      # Python cache
         r'^\.?(v|virtual|)envs?$',                      # Python virtual environments
         r'^node_modules$',                              # NodeJS
         r'^\.cache',                                    # Caches
@@ -288,7 +289,7 @@ class Backup:
 
     def should_exclude(self, path: pathlib.Path, info: tarfile.TarInfo) -> bool:
         if any(pattern.search(path.name) for pattern in self.exclude):
-            return False
+            return True
         return not any(getattr(info, f'is{file_type}')() for file_type in self.file_types)
 
     @functools.cached_property
@@ -317,8 +318,13 @@ class Backup:
             fields['timestamp'] = datetime.datetime.strptime(timestamp, cls.TIMESTAMP_FORMAT)
         return Backup(**fields)
 
-    # @contextlib.contextmanager
-    # @staticmethod
+    def scan(self, tar: tarfile.TarFile, sources: typing.Sequence[pathlib.Path]):
+        trees = (FileHashTree.scan(tar, source, exclude=self.should_exclude)
+                 for source in filter_prefixes(sources))
+        self.root = functools.reduce(operator.or_, trees, self.root)
+
+    def digest(self, *args, **kwargs):
+        self.root = self.root.with_digests(*args, hash_alg=self.hash_alg, **kwargs)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -332,18 +338,63 @@ class Archive:
     def _metadata_path(self) -> pathlib.Path:
         return self.path / self.METADATA_DIR_NAME
 
+    def read_metadata(self, path: pathlib.Path):
+        with open(path) as metadata_file:
+            self.metadata.append(Backup.from_dict(json.load(metadata_file)))
+
+    def write_metadata(self, backup: Backup):
+        with open(self._metadata_path / f'{backup.fmt_timestamp}-metadata.json', 'w+') as metadata_file:
+            json.dump(backup.to_dict(), metadata_file, separators=(',', ':'))
+
     def __enter__(self):
         self._metadata_path.mkdir(parents=True, exist_ok=True)
-        for path in self._metadata_path.iterdir():
-            with open(path) as metadata_file:
-                self.metadata.append(Backup.from_dict(**json.load(metadata_file)))
+        for path in sorted(self._metadata_path.iterdir()):
+            self.read_metadata(path)
+        self.metadata.sort(key = lambda backup: backup.timestamp)
         return self
 
     def __exit__(self, _exc, _exc_type, _tb):
         self.metadata.clear()
 
-    def create(self):
-        pass
+    @contextlib.contextmanager
+    def open_tar(self, backup: Backup, mode: str = 'r', compression: typing.Optional[str] = None):
+        compression = compression or ''
+        filename = f'{backup.fmt_timestamp}-backup.tar{"." + compression if compression else ""}'
+        with tarfile.open(str(self.path / filename), mode + '|' + compression) as tar:
+            yield tar
+
+    @staticmethod
+    def _bar_update_hook(bar: ProgressBar, info: tarfile.TarInfo,
+                         _file_handle: typing.Optional[io.FileIO] = None):
+        if info.size > 0:
+            bar.update(info)
+
+    def add_files(self, tar: tarfile.TarFile, diff: FileHashTree):
+        with ProgressBar(diff.size) as bar:
+            for node in diff:
+                if node.info:
+                    path = FileHashTree.ROOT.joinpath(node.info.name)
+                    if node.info.isfile():
+                        with open(path, 'rb') as file_handle:
+                            tar.addfile(node.info, file_handle)
+                    else:
+                        tar.addfile(node.info)
+                    if node.info.size > 0:
+                        bar.update(node.info)
+
+    def create(self, **options):
+        backup = Backup.from_dict(options)
+        with self.open_tar(backup, mode='w', compression=options['compression']) as tar:
+            backup.scan(tar, options['source'])
+            with ProgressBar(backup.root.size, slow_rate=96*MEBIBYTE, medium_rate=128*MEBIBYTE) as bar:
+                backup.digest(hook=functools.partial(self._bar_update_hook, bar))
+            self.write_metadata(backup)
+            base = self.metadata[-1].root if self.metadata else None
+            if diff := backup.root - base:
+                self.add_files(tar, diff)
+            else:
+                click.secho('No new or modified files to archive.', fg='green', bold=True)
+            # print(json.dumps(diff.to_dict(), indent=2))
 
 
 def filter_prefixes(sources: typing.Sequence[pathlib.Path]) \
@@ -395,38 +446,8 @@ def cli(ctx, **options):
 @click.pass_context
 def create(ctx, **options):
     """ Create a backup. """
-    compression = options['compression'] or ''
-    timestamp = datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')
-    filename = f'{timestamp}-backup.tar{"." + compression if compression else ""}'
-
     with Archive(ctx.obj['archive']) as archive:
-        print(archive)
-        # print(backup := Backup.from_dict(options))
-        # print(backup == Backup.from_dict(backup.to_dict()))
-
-    # sources = tuple(filter_prefixes(options['source']))
-    # with Backup(ctx.obj['archive'], options['hash'], options['exclude'], set(options['type'])) as archive:
-    #     print(archive)
-
-    """
-    with tarfile.open(str(ctx.obj['archive'] / filename), 'w|' + compression) as tar:
-        # trees = (FileHashTree.scan(tar, source) for source in sources)
-        # root = functools.reduce(operator.or_, trees, None)
-        # root = root.with_digests()
-        # print(json.dumps((root - FileHashTree.scan(tar, sources[0]).with_digests()).to_dict(), indent=2))
-
-        # print(root.digest)
-        # for x in root:
-        #     print(x.info)
-        # node = root['/home/jonathanlee/uc-berkeley/2016-fall']
-        # print(node.digest)
-        # print(json.dumps(root.to_dict(), indent=2))
-        # print(FileHashTree.from_dict(root.to_dict()) == root)
-
-        # archive = Archive(tar, options['hash'], options['type'])
-        #     with ProgressBar(total_bytes) as bar:
-        #         archive.create(infos, bar, executor)
-    """
+        archive.create(**options)
 
 
 @cli.command()
