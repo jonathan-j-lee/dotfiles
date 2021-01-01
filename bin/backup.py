@@ -39,7 +39,7 @@ class AbortException(Exception):
 @dataclasses.dataclass
 class ProgressBar:
     total_bytes: int
-    width: int = 25
+    width: int = 40
     fill_char: str = '#'
     empty_char: str = '.'
     slow_rate: float = 8*MEBIBYTE  # About 0.533 GiB/min
@@ -63,6 +63,10 @@ class ProgressBar:
     @property
     def progress(self) -> float:
         return self.bytes_processed/self.total_bytes
+
+    @property
+    def duration(self) -> datetime.timedelta:
+        return self.last_update - self.time_started
 
     def update_rate(self, info, default: float = KIBIBYTE) -> float:
         """ Computes the archive rate in bytes per second. """
@@ -89,10 +93,10 @@ class ProgressBar:
         long_term_rate = self.bytes_processed/(self.last_update - self.time_started).total_seconds()
         return datetime.timedelta(seconds=(self.total_bytes - self.bytes_processed)/long_term_rate)
 
-    def format_eta(self, eta: datetime.timedelta) -> str:
-        if eta == datetime.timedelta.max:
+    def format_duration(self, duration: datetime.timedelta) -> str:
+        if duration == datetime.timedelta.max:
             return ':'.join(3*['--'])
-        seconds = int(eta.total_seconds())
+        seconds = int(duration.total_seconds())
         seconds, minutes = seconds%60, seconds//60
         minutes, hours = minutes%60, minutes//60
         return '{}:{:0>2}:{:0>2}'.format(hours, minutes, seconds)
@@ -114,7 +118,8 @@ class ProgressBar:
             filename += f' ({humanize_file_size(info.size)})'
         click.echo(' | '.join([
             f'[{full}{empty}] {percentage}',
-            f'ETA: {self.format_eta(self.eta)}, Rate: {self.format_rate(rate)}',
+            f'Runtime: {self.format_duration(self.duration)}, '
+            f'ETA: {self.format_duration(self.eta)}, Rate: {self.format_rate(rate)}',
             filename,
         ]) + '\r', nl=False)
 
@@ -392,7 +397,8 @@ class Archive:
         if info.size > 0:
             bar.update(info)
 
-    def add_files(self, tar: tarfile.TarFile, diff: FileHashTree, bar: typing.Optional[ProgressBar] = None):
+    def add_files(self, tar: tarfile.TarFile, diff: FileHashTree,
+                  bar: typing.Optional[ProgressBar] = None):
         for node in diff:
             if node.info:
                 path = FileHashTree.ROOT.joinpath(node.info.name)
