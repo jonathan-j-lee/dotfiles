@@ -21,7 +21,19 @@ import click
 
 KIBIBYTE, MEBIBYTE, GIBIBYTE = 2**10, 2**20, 2**30
 as_path = lambda _ctx, path: pathlib.Path(path)
-as_paths = lambda _ctx, paths: tuple(map(pathlib.Path, paths))
+
+
+def humanize_file_size(byte_count: int, rounding: int = 1) -> str:
+    prefixes = ['', 'Ki', 'Mi', 'Gi']
+    sizes = [1, KIBIBYTE, MEBIBYTE, GIBIBYTE, float('inf')]
+    for prefix, divisor, limit in zip(prefixes, sizes[:-1], sizes[1:]):
+        if byte_count < limit:
+            value = byte_count if divisor == 1 else round(byte_count/divisor, rounding)
+            return f'{value} {prefix}B'
+
+
+class AbortException(Exception):
+    pass
 
 
 @dataclasses.dataclass
@@ -52,14 +64,6 @@ class ProgressBar:
     def progress(self) -> float:
         return self.bytes_processed/self.total_bytes
 
-    def humanize_file_size(self, byte_count: int, rounding: int = 1) -> str:
-        prefixes = ['', 'Ki', 'Mi', 'Gi']
-        sizes = [1, KIBIBYTE, MEBIBYTE, GIBIBYTE, float('inf')]
-        for prefix, divisor, limit in zip(prefixes, sizes[:-1], sizes[1:]):
-            if byte_count < limit:
-                value = byte_count if divisor == 1 else round(byte_count/divisor, rounding)
-                return f'{value} {prefix}B'
-
     def update_rate(self, info, default: float = KIBIBYTE) -> float:
         """ Computes the archive rate in bytes per second. """
         now = datetime.datetime.now()
@@ -76,7 +80,7 @@ class ProgressBar:
             fg = 'yellow'
         else:
             fg = 'green'
-        return click.style(self.humanize_file_size(rate) + '/s', fg=fg, bold=True)
+        return click.style(humanize_file_size(rate) + '/s', fg=fg, bold=True)
 
     @property
     def eta(self) -> datetime.timedelta:
@@ -107,7 +111,7 @@ class ProgressBar:
         rate = self.update_rate(info)
         filename = click.style(pathlib.Path(info.name).name, fg='cyan', bold=True)
         if info.size > 0:
-            filename += f' ({self.humanize_file_size(info.size)})'
+            filename += f' ({humanize_file_size(info.size)})'
         click.echo(' | '.join([
             f'[{full}{empty}] {percentage}',
             f'ETA: {self.format_eta(self.eta)}, Rate: {self.format_rate(rate)}',
@@ -176,7 +180,7 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
             yield from child
 
     def __len__(self) -> int:
-        return bool(self.info) + sum(map(len, self.children))
+        return bool(self.info) + sum(map(len, self.children.values()))
 
     @classmethod
     def scan(cls, tar: tarfile.TarFile, path: pathlib.Path,
@@ -238,7 +242,7 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
     __ror__ = __or__
 
     def __sub__(self, other: typing.Optional['FileHashTree']) -> typing.Optional['FileHashTree']:
-        if not other:
+        if other is None:
             return self
         if self.digest != other.digest:
             children = {part: diff for part, child in self.children.items()
@@ -326,6 +330,14 @@ class Backup:
     def digest(self, *args, **kwargs):
         self.root = self.root.with_digests(*args, hash_alg=self.hash_alg, **kwargs)
 
+    def get_tar_filename(self, compression: str = '') -> str:
+        filename = f'{self.fmt_timestamp}-backup.tar'
+        return filename + '.' + compression if compression else filename
+
+    @functools.cached_property
+    def metadata_filename(self) -> str:
+        return f'{self.fmt_timestamp}-metadata.json'
+
 
 @dataclasses.dataclass(frozen=True)
 class Archive:
@@ -343,7 +355,7 @@ class Archive:
             self.metadata.append(Backup.from_dict(json.load(metadata_file)))
 
     def write_metadata(self, backup: Backup):
-        with open(self._metadata_path / f'{backup.fmt_timestamp}-metadata.json', 'w+') as metadata_file:
+        with open(self._metadata_path / backup.metadata_filename, 'w+') as metadata_file:
             json.dump(backup.to_dict(), metadata_file, separators=(',', ':'))
 
     def __enter__(self):
@@ -357,15 +369,17 @@ class Archive:
         self.metadata.clear()
 
     @contextlib.contextmanager
-    def open_tar(self, backup: Backup, mode: str = 'r', compression: typing.Optional[str] = None):
-        compression = compression or ''
-        filename = f'{backup.fmt_timestamp}-backup.tar{"." + compression if compression else ""}'
-        with tarfile.open(str(self.path / filename), mode + '|' + compression) as tar:
-            yield tar
+    def open_tar(self, filename: str, mode: str):
+        path = self.path / filename
+        try:
+            with tarfile.open(str(path), mode) as tar:
+                yield tar
+        except AbortException:
+            path.unlink(missing_ok=True)
 
     @staticmethod
-    def _bar_update_hook(bar: ProgressBar, info: tarfile.TarInfo,
-                         _file_handle: typing.Optional[io.FileIO] = None):
+    def bar_update_hook(bar: ProgressBar, info: tarfile.TarInfo,
+                        _file_handle: typing.Optional[io.FileIO] = None):
         if info.size > 0:
             bar.update(info)
 
@@ -382,19 +396,13 @@ class Archive:
                     if node.info.size > 0:
                         bar.update(node.info)
 
-    def create(self, **options):
-        backup = Backup.from_dict(options)
-        with self.open_tar(backup, mode='w', compression=options['compression']) as tar:
-            backup.scan(tar, options['source'])
-            with ProgressBar(backup.root.size, slow_rate=96*MEBIBYTE, medium_rate=128*MEBIBYTE) as bar:
-                backup.digest(hook=functools.partial(self._bar_update_hook, bar))
-            self.write_metadata(backup)
-            base = self.metadata[-1].root if self.metadata else None
-            if diff := backup.root - base:
-                self.add_files(tar, diff)
-            else:
-                click.secho('No new or modified files to archive.', fg='green', bold=True)
-            # print(json.dumps(diff.to_dict(), indent=2))
+    # def find_backup(self, backup_id: str) -> typing.Optional[Backup]:
+    #     try:
+    #         timestamp = datetime.datetime.strptime(backup_id, Backup.TIMESTAMP_FORMAT)
+    #     except ValueError:
+    #         for backup in reversed(self.metadata):
+    #             if backup.root and (backup.root.digest or b'').hex() == backup_id:
+    #                 pass
 
 
 def filter_prefixes(sources: typing.Sequence[pathlib.Path]) \
@@ -429,12 +437,11 @@ def cli(ctx, **options):
     ctx.obj.update(options)
 
 
+# TODO: consider encryption/signing archives.
 @cli.command()
-@click.option('--source', default=[str(pathlib.Path.home())], callback=as_paths,
-              show_default=True, type=click.Path(exists=True), multiple=True,
-              help='Directories to backup.')
-@click.option('--compression', type=click.Choice(['gz', 'bz2', 'xz']),
-              help='Compression method (no compression by default).')
+@click.option('--compression', default='none', show_default=True,
+              callback = lambda _ctx, value: '' if value == 'none' else value,
+              type=click.Choice(['none', 'gz', 'bz2', 'xz']), help='Compression method.')
 @click.option('--hash-alg', default=Backup.HASH_ALGORITHMS[0],
               type=click.Choice(Backup.HASH_ALGORITHMS),
               help='Hashing algorithm used to check file equality.')
@@ -443,23 +450,64 @@ def cli(ctx, **options):
               help='Special file types to archive.')
 @click.option('--exclude', default=Backup.DEFAULT_EXCLUDE,
               multiple=True, help='Regular expression of files to exclude.')
+@click.option('--max-size', type=int, default=100*MEBIBYTE,
+              help='Maximum file size. [default: 100 MiB]')
+@click.argument('source', nargs=-1, type=click.Path(exists=True),
+                callback = lambda _ctx, values: tuple(filter_prefixes(map(pathlib.Path, values))))
 @click.pass_context
 def create(ctx, **options):
     """ Create a backup. """
     with Archive(ctx.obj['archive']) as archive:
-        archive.create(**options)
+        backup = Backup.from_dict(options)
+        filename = backup.get_tar_filename(options['compression'])
+        with archive.open_tar(filename, 'w|' + options['compression']) as tar:
+            click.secho(':: Hashing files ...')
+            backup.scan(tar, options['source'])
+            with ProgressBar(backup.root.size, slow_rate=96*MEBIBYTE, medium_rate=128*MEBIBYTE) as bar:
+                backup.digest(hook=functools.partial(Archive.bar_update_hook, bar))
+
+            click.secho(f'Scanned {len(backup.root)} files ({humanize_file_size(backup.root.size)}).',
+                        fg='cyan', bold=True)
+            click.echo(f'Ready to write archive to {filename!r}.')
+            if not click.confirm('Commit to disk?'):
+                raise AbortException
+
+            base = archive.metadata[-1].root if archive.metadata else None
+            if diff := backup.root - base:
+                archive.write_metadata(backup)
+                click.echo(f'Wrote metadata to {backup.metadata_filename!r}')
+                archive.add_files(tar, diff)
+                click.secho(f'Added {len(diff)} modified files '
+                            f'({humanize_file_size(diff.size)}) to archive.',
+                            fg='green', bold=True)
+            else:
+                click.secho('No modified files to archive.', fg='yellow', bold=True)
+                raise AbortException
 
 
 @cli.command()
+@click.option('--dry-mode', is_flag=True, help='Do not write.')
+@click.option('--backup', help='Timestamp or hash digest. Defaults to the latest backup.')
 @click.pass_context
-def restore(ctx):
+def restore(ctx, **options):
     """ Restore a backup. """
+    with Archive(ctx.obj['archive']) as archive:
+        pass
 
 
 @cli.command('list')
 @click.pass_context
 def list_backups(ctx):
     """ List available backups. """
+    with Archive(ctx.obj['archive']) as archive:
+        metadata = [backup for backup in archive.metadata
+                    if backup.root is not None and backup.root.digest]
+        if metadata:
+            click.secho('Backups:', bold=True)
+            for backup in metadata:
+                click.echo(f'  {backup.fmt_timestamp} {backup.hash_alg} {backup.root.digest.hex()}')
+        else:
+            click.secho('No backups found.', fg='yellow', bold=True)
 
 
 @cli.command()
@@ -472,13 +520,6 @@ def remove(ctx):
 @click.pass_context
 def check(ctx):
     pass
-
-
-# @click.option('-m', '--max-size', default=100*MEBIBYTE)
-# @click.option('-e', '--exclude', multiple=True, default=DEFAULT_EXCLUDE)
-# @click.option('--encrypt/--no-encrypt', default=True, help='Encrypt archive')
-# @click.option('--sign/--no-sign', default=True)
-# traverse_tree(pathlib.Path(options['source']), [re.compile(pattern) for pattern in options['exclude']])
 
 
 if __name__ == '__main__':
