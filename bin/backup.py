@@ -250,7 +250,9 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
             return FileHashTree(self.info, children, self.digest)
 
     def to_dict(self) -> dict:
-        node = {'digest': self.digest.hex()}
+        node = {}
+        if digest := self.digest.hex():
+            node['digest'] = digest
         if children := {part: child.to_dict() for part, child in self.children.items()}:
             node['children'] = children
         return node
@@ -286,7 +288,7 @@ class Backup:
     file_types: set[str] = dataclasses.field(default_factory=set)
     timestamp: datetime.datetime = dataclasses.field(
         default_factory=lambda: datetime.datetime.utcnow().replace(microsecond=0))
-    root: typing.Optional[FileHashTree] = None
+    root: FileHashTree = dataclasses.field(default_factory=FileHashTree)
 
     def __post_init__(self):
         self.file_types.update({'file', 'dir'})
@@ -306,7 +308,7 @@ class Backup:
             'exclude': [pattern.pattern for pattern in self.exclude],
             'file_types': sorted(self.file_types),
             'timestamp': self.fmt_timestamp,
-            'root': self.root.to_dict() if self.root else None,
+            'root': self.root.to_dict(),
         }
 
     @classmethod
@@ -350,9 +352,16 @@ class Archive:
     def _metadata_path(self) -> pathlib.Path:
         return self.path / self.METADATA_DIR_NAME
 
+    @property
+    def last_backup(self) -> typing.Optional[Backup]:
+        if self.metadata:
+            return self.metadata[-1]
+
     def read_metadata(self, path: pathlib.Path):
         with open(path) as metadata_file:
-            self.metadata.append(Backup.from_dict(json.load(metadata_file)))
+            backup = Backup.from_dict(json.load(metadata_file))
+            if backup.root.digest:
+                self.metadata.append(backup)
 
     def write_metadata(self, backup: Backup):
         with open(self._metadata_path / backup.metadata_filename, 'w+') as metadata_file:
@@ -383,29 +392,25 @@ class Archive:
         if info.size > 0:
             bar.update(info)
 
-    def add_files(self, tar: tarfile.TarFile, diff: FileHashTree):
-        with ProgressBar(diff.size) as bar:
-            for node in diff:
-                if node.info:
-                    path = FileHashTree.ROOT.joinpath(node.info.name)
-                    if node.info.isfile():
-                        with open(path, 'rb') as file_handle:
-                            tar.addfile(node.info, file_handle)
-                    else:
-                        tar.addfile(node.info)
-                    if node.info.size > 0:
-                        bar.update(node.info)
+    def add_files(self, tar: tarfile.TarFile, diff: FileHashTree, bar: typing.Optional[ProgressBar] = None):
+        for node in diff:
+            if node.info:
+                path = FileHashTree.ROOT.joinpath(node.info.name)
+                if node.info.isfile():
+                    with open(path, 'rb') as file_handle:
+                        tar.addfile(node.info, file_handle)
+                else:
+                    tar.addfile(node.info)
+                if bar and node.info.size > 0:
+                    bar.update(node.info)
 
-    # def find_backup(self, backup_id: str) -> typing.Optional[Backup]:
-    #     try:
-    #         timestamp = datetime.datetime.strptime(backup_id, Backup.TIMESTAMP_FORMAT)
-    #     except ValueError:
-    #         for backup in reversed(self.metadata):
-    #             if backup.root and (backup.root.digest or b'').hex() == backup_id:
-    #                 pass
+    def find_backup(self, digest: bytes) -> typing.Optional[Backup]:
+        for backup in reversed(self.metadata):
+            if backup.root.digest == digest:
+                return backup
 
 
-def filter_prefixes(sources: typing.Sequence[pathlib.Path]) \
+def filter_prefixes(sources: typing.Iterable[pathlib.Path]) \
         -> typing.Iterable[pathlib.Path]:
     """
     Filter a list of paths such that no path is a prefix of any other.
@@ -413,11 +418,10 @@ def filter_prefixes(sources: typing.Sequence[pathlib.Path]) \
     Returns:
         The filtered paths in sorted order, coerced as absolute paths.
     """
-    if not sources:
+    if not (sources := sorted(source.absolute() for source in sources)):
         return
-    sources = iter(sorted(source.absolute() for source in sources))
-    yield (current_path := next(sources))
-    for next_path in sources:
+    yield (current_path := sources[0])
+    for next_path in sources[1:]:
         if not next_path.is_relative_to(current_path):
             yield (current_path := next_path)
 
@@ -426,7 +430,8 @@ def filter_prefixes(sources: typing.Sequence[pathlib.Path]) \
 @click.option('--archive', default=str(pathlib.Path.cwd()), callback=as_path,
               type=click.Path(file_okay=False, exists=True),
               help='Directory the backups and metadata are written to.')
-@click.option('--dry-run', is_flag=True, help='Do not make persistent changes.')
+@click.option('--confirm/--no-confirm', default=True,
+              help='Toggle confirmation prompts of critical tasks.')
 @click.version_option(version='0.0.1', message='v%(version)s')
 @click.pass_context
 def cli(ctx, **options):
@@ -435,6 +440,8 @@ def cli(ctx, **options):
     """
     ctx.ensure_object(dict)
     ctx.obj.update(options)
+    if not options['confirm']:
+        click.confirm = lambda *args, **kwargs: True
 
 
 # TODO: consider encryption/signing archives.
@@ -453,7 +460,7 @@ def cli(ctx, **options):
 @click.option('--max-size', type=int, default=100*MEBIBYTE,
               help='Maximum file size. [default: 100 MiB]')
 @click.argument('source', nargs=-1, type=click.Path(exists=True),
-                callback = lambda _ctx, values: tuple(filter_prefixes(map(pathlib.Path, values))))
+                callback = lambda _ctx, values: tuple(map(pathlib.Path, values)))
 @click.pass_context
 def create(ctx, **options):
     """ Create a backup. """
@@ -461,7 +468,6 @@ def create(ctx, **options):
         backup = Backup.from_dict(options)
         filename = backup.get_tar_filename(options['compression'])
         with archive.open_tar(filename, 'w|' + options['compression']) as tar:
-            click.secho(':: Hashing files ...')
             backup.scan(tar, options['source'])
             with ProgressBar(backup.root.size, slow_rate=96*MEBIBYTE, medium_rate=128*MEBIBYTE) as bar:
                 backup.digest(hook=functools.partial(Archive.bar_update_hook, bar))
@@ -472,11 +478,12 @@ def create(ctx, **options):
             if not click.confirm('Commit to disk?'):
                 raise AbortException
 
-            base = archive.metadata[-1].root if archive.metadata else None
+            base = last.root if (last := archive.last_backup) else None
             if diff := backup.root - base:
                 archive.write_metadata(backup)
                 click.echo(f'Wrote metadata to {backup.metadata_filename!r}')
-                archive.add_files(tar, diff)
+                with ProgressBar(diff.size) as bar:
+                    archive.add_files(tar, diff, bar)
                 click.secho(f'Added {len(diff)} modified files '
                             f'({humanize_file_size(diff.size)}) to archive.',
                             fg='green', bold=True)
@@ -485,14 +492,32 @@ def create(ctx, **options):
                 raise AbortException
 
 
+def parse_hash(_ctx, value: typing.Optional[str]) -> bytes:
+    try:
+        return bytes.fromhex(value or '')
+    except ValueError as exc:
+        raise click.BadParameter(f'Hash is not a hexadecimal string: {value!r}') from exc
+
+
+hash_argument = click.argument('hash', required=False, callback=parse_hash)
+
+
 @cli.command()
-@click.option('--dry-mode', is_flag=True, help='Do not write.')
-@click.option('--backup', help='Timestamp or hash digest. Defaults to the latest backup.')
+@click.option('--dry-mode', is_flag=True, help='Do not persist changes.')
+@click.option('--destructive', is_flag=True, help='Destroy existing files.')
+# @click.option('--mount', multiple=True, help='Alternate mount points.')
+@hash_argument
 @click.pass_context
 def restore(ctx, **options):
     """ Restore a backup. """
     with Archive(ctx.obj['archive']) as archive:
-        pass
+        if not (last := archive.last_backup):
+            click.secho('No backups available.', fg='red', bold=True)
+            return
+        if not (backup := archive.find_backup(digest := options['hash'] or last.root.digest)):
+            click.secho(f'No backup found with digest: {digest.hex()!r}', fg='red', bold=True)
+            return
+        print(backup.root.digest)
 
 
 @cli.command('list')
@@ -500,26 +525,19 @@ def restore(ctx, **options):
 def list_backups(ctx):
     """ List available backups. """
     with Archive(ctx.obj['archive']) as archive:
-        metadata = [backup for backup in archive.metadata
-                    if backup.root is not None and backup.root.digest]
-        if metadata:
+        if archive.metadata:
             click.secho('Backups:', bold=True)
-            for backup in metadata:
+            for backup in archive.metadata:
                 click.echo(f'  {backup.fmt_timestamp} {backup.hash_alg} {backup.root.digest.hex()}')
         else:
             click.secho('No backups found.', fg='yellow', bold=True)
 
 
 @cli.command()
+@hash_argument
 @click.pass_context
 def remove(ctx):
-    """ Remove backup. """
-
-
-@cli.command()
-@click.pass_context
-def check(ctx):
-    pass
+    """ Remove and merge a backup. """
 
 
 if __name__ == '__main__':
