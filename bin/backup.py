@@ -138,14 +138,13 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
     by name to ensure the preimage is well-defined.
 
     Attributes:
-        digest: The hash value. May be empty.
+        digest: The hash value. May be empty for non-archived files.
         children: Maps names to child files. Only nonempty for directories.
         info: An optional `tarfile.TarInfo` containing metadata written to a
-            Tar file. May be missing because the node represents a parent
-            directory not being archived, or because the tree is deserialized.
-            Because the Tar info is used to compute the digest, this field is
-            not used for comparison.
-
+            Tar file. May be missing because the node represents a directory
+            not being archived, or because the tree is deserialized. Because
+            the Tar info is used to compute the digest, this field is not used
+            for comparison.
     """
     info: typing.Optional[tarfile.TarInfo] = \
         dataclasses.field(default=None, repr=False, compare=False)
@@ -187,6 +186,12 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
     def __len__(self) -> int:
         return bool(self.info) + sum(map(len, self.children.values()))
 
+    def flatten(self, cwd: pathlib.Path = ROOT) -> typing.Mapping[pathlib.Path, 'FileHashTree']:
+        path_table = {cwd: self}
+        for part, child in sorted(self.children.items()):
+            path_table.update(child.flatten(cwd=cwd.joinpath(part)))
+        return path_table
+
     @classmethod
     def scan(cls, tar: tarfile.TarFile, path: pathlib.Path,
              base: typing.Optional[pathlib.Path] = None,
@@ -216,8 +221,7 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
                      hash_alg: str = 'sha256', sep: bytes = b'|') -> 'FileHashTree':
         children = {part: child.with_digests(path.joinpath(part), hook, hash_alg, sep)
                     for part, child in sorted(self.children.items())}
-        digest = functools.partial(self._digest, hash_alg=hash_alg)
-        info_digest = content_digest = b''
+        make_digest = functools.partial(self._digest, hash_alg=hash_alg)
         if self.info:
             info_digest = digest(self.info.tobuf())
             if self.info.isfile():
@@ -229,8 +233,12 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
                         hook(self.info, file_handle)
             elif hook:
                 hook(self.info)
-        digests = [info_digest, content_digest] + [child.digest for child in children.values()]
-        return FileHashTree(self.info, children, digest(sep.join(digests)))
+                content_digest = b''
+            parts = [info_digest, content_digest] + [child.digest for child in children.values()]
+            digest = make_digest(sep.join(parts))
+        else:
+            digest = b''
+        return FileHashTree(self.info, children, digest)
 
     def __or__(self, other: typing.Optional['FileHashTree']) -> 'FileHashTree':
         """
@@ -251,7 +259,7 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
             return self
         if self.digest != other.digest:
             children = {part: diff for part, child in self.children.items()
-                        if (diff := child - other.children.get(part))}
+                        if (diff := child - other.children.get(part)) is not None}
             return FileHashTree(self.info, children, self.digest)
 
     def to_dict(self) -> dict:
@@ -285,9 +293,11 @@ class Backup:
         r'^\.DS_Store$',                                # macOS
     ]
     HASH_ALGORITHMS = ('sha256', 'sha384', 'sha512')
+    COMPRESSION_OPTIONS = ('none', 'gz', 'bz2', 'xz')
     TIMESTAMP_FORMAT = '%Y-%m-%dT%H%M%S'
 
     hash_alg: str = HASH_ALGORITHMS[0]
+    compression: str = COMPRESSION_OPTIONS[0]
     exclude: typing.Sequence[re.Pattern] = \
         dataclasses.field(default_factory=functools.partial(list, DEFAULT_EXCLUDE))
     file_types: set[str] = dataclasses.field(default_factory=set)
@@ -297,6 +307,8 @@ class Backup:
 
     def __post_init__(self):
         self.file_types.update({'file', 'dir'})
+        if self.compression == 'none':
+            self.compression = ''
 
     def should_exclude(self, path: pathlib.Path, info: tarfile.TarInfo) -> bool:
         if any(pattern.search(path.name) for pattern in self.exclude):
@@ -310,6 +322,7 @@ class Backup:
     def to_dict(self) -> dict:
         return {
             'hash_alg': self.hash_alg,
+            'compression': self.compression,
             'exclude': [pattern.pattern for pattern in self.exclude],
             'file_types': sorted(self.file_types),
             'timestamp': self.fmt_timestamp,
@@ -318,7 +331,7 @@ class Backup:
 
     @classmethod
     def from_dict(cls, data) -> 'Backup':
-        fields = {'hash_alg': data['hash_alg']}
+        fields = {field: value for field in ('hash_alg', 'compression') if (value := data.get(field))}
         if (exclude := data.get('exclude')) is not None:
             fields['exclude'] = tuple(map(re.compile, exclude))
         if (file_types := data.get('file_types')) is not None:
@@ -337,9 +350,10 @@ class Backup:
     def digest(self, *args, **kwargs):
         self.root = self.root.with_digests(*args, hash_alg=self.hash_alg, **kwargs)
 
-    def get_tar_filename(self, compression: str = '') -> str:
+    @functools.cached_property
+    def tar_filename(self) -> str:
         filename = f'{self.fmt_timestamp}-backup.tar'
-        return filename + '.' + compression if compression else filename
+        return filename + '.' + self.compression if self.compression else filename
 
     @functools.cached_property
     def metadata_filename(self) -> str:
@@ -386,10 +400,11 @@ class Archive:
     def open_tar(self, filename: str, mode: str):
         path = self.path / filename
         try:
-            with tarfile.open(str(path), mode) as tar:
+            with tarfile.open(path, mode) as tar:
                 yield tar
         except AbortException:
-            path.unlink(missing_ok=True)
+            if mode.startswith('w'):
+                path.unlink(missing_ok=True)
 
     @staticmethod
     def bar_update_hook(bar: ProgressBar, info: tarfile.TarInfo,
@@ -414,6 +429,21 @@ class Archive:
         for backup in reversed(self.metadata):
             if backup.root.digest == digest:
                 return backup
+
+    def partition(self, backup: Backup) -> typing.Mapping[bytes, typing.Set[pathlib.Path]]:
+        targets, partitions = backup.root.flatten(), collections.defaultdict(set)
+        sentinel = FileHashTree()
+        for base, current in list(zip([None] + self.metadata[:-1], self.metadata))[::-1]:
+            if (diff := current.root - (base.root if base else None)) is not None:
+                for path, node in diff.flatten().items():
+                    if any(path in paths for paths in partitions.values()):
+                        continue
+                    if node.digest == targets.get(path, sentinel).digest:
+                        partitions[current.root.digest].add(path)
+                        del targets[path]
+        if targets:
+            raise ValueError('Not all files found in backups')
+        return partitions
 
 
 def filter_prefixes(sources: typing.Iterable[pathlib.Path]) \
@@ -452,16 +482,15 @@ def cli(ctx, **options):
 
 # TODO: consider encryption/signing archives.
 @cli.command()
-@click.option('--compression', default='none', show_default=True,
-              callback = lambda _ctx, value: '' if value == 'none' else value,
-              type=click.Choice(['none', 'gz', 'bz2', 'xz']), help='Compression method.')
+@click.option('--compression', default=Backup.COMPRESSION_OPTIONS[0], show_default=True,
+              type=click.Choice(Backup.COMPRESSION_OPTIONS), help='Compression method.')
 @click.option('--hash-alg', default=Backup.HASH_ALGORITHMS[0],
               type=click.Choice(Backup.HASH_ALGORITHMS),
               help='Hashing algorithm used to check file equality.')
 @click.option('--type', default=['sym'], show_default=True, multiple=True,
               type=click.Choice(['sym', 'lnk', 'chr', 'blk', 'fifo']),
               help='Special file types to archive.')
-@click.option('--exclude', default=Backup.DEFAULT_EXCLUDE,
+@click.option('--exclude', metavar='[PATTERN]', default=Backup.DEFAULT_EXCLUDE,
               multiple=True, help='Regular expression of files to exclude.')
 @click.option('--max-size', type=int, default=100*MEBIBYTE,
               help='Maximum file size. [default: 100 MiB]')
@@ -472,15 +501,14 @@ def create(ctx, **options):
     """ Create a backup. """
     with Archive(ctx.obj['archive']) as archive:
         backup = Backup.from_dict(options)
-        filename = backup.get_tar_filename(options['compression'])
-        with archive.open_tar(filename, 'w|' + options['compression']) as tar:
+        with archive.open_tar(backup.tar_filename, 'w|' + backup.compression) as tar:
             backup.scan(tar, options['source'])
             with ProgressBar(backup.root.size, slow_rate=96*MEBIBYTE, medium_rate=128*MEBIBYTE) as bar:
                 backup.digest(hook=functools.partial(Archive.bar_update_hook, bar))
 
             click.secho(f'Scanned {len(backup.root)} files ({humanize_file_size(backup.root.size)}).',
                         fg='cyan', bold=True)
-            click.echo(f'Ready to write archive to {filename!r}.')
+            click.echo(f'Ready to write archive to {backup.tar_filename!r}.')
             if not click.confirm('Commit to disk?'):
                 raise AbortException
 
@@ -506,12 +534,38 @@ def parse_hash(_ctx, value: typing.Optional[str]) -> bytes:
 
 
 hash_argument = click.argument('hash', required=False, callback=parse_hash)
+Mount = tuple[pathlib.Path, typing.Optional[pathlib.Path]]
+
+
+def parse_mounts(_ctx, values: tuple[str, ...]) -> list[Mount]:
+    mounts = []
+    for mount in values:
+        src, dst = mount.split(':')
+        mounts.append((pathlib.Path(src), pathlib.Path(dst) if dst else None))
+    return mounts
+
+
+def substitute_mounts(path: pathlib.Path, mounts: list[Mount]) -> typing.Optional[pathlib.Path]:
+    for src, dst in mounts:
+        if path.is_relative_to(src):
+            return dst.joinpath(path.relative_to(src)) if dst else None
+    return path
+
+
+def get_mounted_targets(tar: tarfile.TarFile, targets: set[pathlib.Path], mounts: list[Mount]) \
+        -> typing.Iterable[tuple[pathlib.Path, pathlib.Path, tarfile.TarInfo]]:
+    for info in tar:
+        path = FileHashTree.ROOT.joinpath(info.name)
+        if path in targets and (mounted_path := substitute_mounts(path, mounts)):
+            info.name = mounted_path.name
+            yield mounted_path, path, info
 
 
 @cli.command()
-@click.option('--dry-mode', is_flag=True, help='Do not persist changes.')
+@click.option('--dry-run', is_flag=True, help='Do not persist changes.')
 @click.option('--destructive', is_flag=True, help='Destroy existing files.')
-# @click.option('--mount', multiple=True, help='Alternate mount points.')
+@click.option('--mount', metavar='[SRC]:[DST]', callback=parse_mounts,
+              multiple=True, help='Alternate mount points.')
 @hash_argument
 @click.pass_context
 def restore(ctx, **options):
@@ -523,7 +577,16 @@ def restore(ctx, **options):
         if not (backup := archive.find_backup(digest := options['hash'] or last.root.digest)):
             click.secho(f'No backup found with digest: {digest.hex()!r}', fg='red', bold=True)
             return
-        print(backup.root.digest)
+        partitions = archive.partition(backup)
+        for backup in archive.metadata:
+            if targets := partitions.get(backup.root.digest):
+                with archive.open_tar(backup.tar_filename, 'r:*') as tar:
+                    mounted_targets = get_mounted_targets(tar, targets, options['mount'])
+                    for mounted_path, path, info in sorted(mounted_targets, reversed=True):
+                        if options['dry_run']:
+                            click.echo(f'{path!s} -> {mounted_path!s}')
+                        else:
+                            tar.extract(info, path=mounted_path.parent)
 
 
 @cli.command('list')
