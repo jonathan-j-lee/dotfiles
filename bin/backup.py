@@ -20,10 +20,10 @@ import click
 
 
 KIBIBYTE, MEBIBYTE, GIBIBYTE = 2**10, 2**20, 2**30
-as_path = lambda _ctx, path: pathlib.Path(path)
 
 
 def humanize_file_size(byte_count: int, rounding: int = 1) -> str:
+    """ Render a file size in bytes as text using human-readable units. """
     prefixes = ['', 'Ki', 'Mi', 'Gi']
     sizes = [1, KIBIBYTE, MEBIBYTE, GIBIBYTE, float('inf')]
     for prefix, divisor, limit in zip(prefixes, sizes[:-1], sizes[1:]):
@@ -32,24 +32,33 @@ def humanize_file_size(byte_count: int, rounding: int = 1) -> str:
             return f'{value} {prefix}B'
 
 
+def format_duration(duration: datetime.timedelta) -> str:
+    if duration == datetime.timedelta.max:
+        return ':'.join(3*['--'])
+    seconds = int(duration.total_seconds())
+    seconds, minutes = seconds%60, seconds//60
+    minutes, hours = minutes%60, minutes//60
+    return '{}:{:0>2}:{:0>2}'.format(hours, minutes, seconds)
+
+
 class AbortException(Exception):
-    pass
+    """ Raised whenever the user aborts an operation by choosing not to confim. """
 
 
 @dataclasses.dataclass
-class ProgressBar:
+class FileProgressBar:
+    """ A CLI-rendered progress bar representing work done on files. """
     total_bytes: int
     width: int = 40
     fill_char: str = '#'
     empty_char: str = '.'
     slow_rate: float = 8*MEBIBYTE  # About 0.533 GiB/min
     medium_rate: float = 16*MEBIBYTE  # About 1.067 GiB/min
+    rate_decay: float = 0.9
     bytes_processed: int = dataclasses.field(default=0, init=False, repr=False)
     time_started: datetime.datetime = dataclasses.field(default=datetime.datetime.min, init=False, repr=False)
     last_update: datetime.datetime = dataclasses.field(default=datetime.datetime.min, init=False, repr=False)
     current_rate: float = dataclasses.field(default=0, init=False, repr=False)
-
-    RATE_DECAY: typing.ClassVar[float] = 0.9
 
     def __enter__(self):
         self.bytes_processed = 0
@@ -62,19 +71,24 @@ class ProgressBar:
 
     @property
     def progress(self) -> float:
+        """ Fraction of bytes processed. """
         return self.bytes_processed/self.total_bytes
 
     @property
     def duration(self) -> datetime.timedelta:
         return self.last_update - self.time_started
 
-    def update_rate(self, info, default: float = KIBIBYTE) -> float:
-        """ Computes the archive rate in bytes per second. """
+    def update_rate(self, size: int) -> float:
+        """
+        Compute a rate in bytes per second.
+
+        The rate is smoothed using an exponential weighted moving average (EWMA).
+        """
         now = datetime.datetime.now()
         delta, self.last_update = now - self.last_update, now
-        if info.size:
-            new_rate = info.size/delta.total_seconds()
-            self.current_rate = (1 - self.RATE_DECAY)*new_rate + self.RATE_DECAY*self.current_rate
+        if size > 0:
+            new_rate = size/delta.total_seconds()
+            self.current_rate = (1 - self.rate_decay)*new_rate + self.rate_decay*self.current_rate
         return self.current_rate
 
     def format_rate(self, rate: float) -> str:
@@ -90,36 +104,29 @@ class ProgressBar:
     def eta(self) -> datetime.timedelta:
         if self.bytes_processed == 0:
             return datetime.timedelta.max
-        long_term_rate = self.bytes_processed/(self.last_update - self.time_started).total_seconds()
-        return datetime.timedelta(seconds=(self.total_bytes - self.bytes_processed)/long_term_rate)
-
-    def format_duration(self, duration: datetime.timedelta) -> str:
-        if duration == datetime.timedelta.max:
-            return ':'.join(3*['--'])
-        seconds = int(duration.total_seconds())
-        seconds, minutes = seconds%60, seconds//60
-        minutes, hours = minutes%60, minutes//60
-        return '{}:{:0>2}:{:0>2}'.format(hours, minutes, seconds)
+        long_term_rate = self.bytes_processed/self.duration.total_seconds()
+        bytes_remaining = self.total_bytes - self.bytes_processed
+        return datetime.timedelta(seconds=bytes_remaining/long_term_rate)
 
     def clear(self):
         width, _ = click.get_terminal_size()
         click.echo(' '*width + '\r', nl=False)
 
-    def update(self, info: tarfile.TarFile):
+    def update(self, name: str, size: int = 0):
         self.clear()
-        self.bytes_processed += info.size
+        self.bytes_processed += size
         full = self.fill_char*int(self.width*self.progress)
         empty = self.empty_char*(self.width - len(full))
-        percentage = '{:.1f}'.format(100*self.progress).rjust(5) + '%'
+        percentage = '{:.1f}%'.format(100*self.progress).rjust(5)
 
-        rate = self.update_rate(info)
-        filename = click.style(pathlib.Path(info.name).name, fg='cyan', bold=True)
-        if info.size > 0:
-            filename += f' ({humanize_file_size(info.size)})'
+        rate = self.update_rate(size)
+        filename = click.style(name, fg='cyan', bold=True)
+        if size > 0:
+            filename += f' ({humanize_file_size(size)})'
         click.echo(' | '.join([
             f'[{full}{empty}] {percentage}',
-            f'Runtime: {self.format_duration(self.duration)}, '
-            f'ETA: {self.format_duration(self.eta)}, Rate: {self.format_rate(rate)}',
+            f'Runtime: {format_duration(self.duration)}, '
+            f'ETA: {format_duration(self.eta)}, Rate: {self.format_rate(rate)}',
             filename,
         ]) + '\r', nl=False)
 
@@ -221,7 +228,8 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
                      hash_alg: str = 'sha256', sep: bytes = b'|') -> 'FileHashTree':
         children = {part: child.with_digests(path.joinpath(part), hook, hash_alg, sep)
                     for part, child in sorted(self.children.items())}
-        make_digest = functools.partial(self._digest, hash_alg=hash_alg)
+        digest = functools.partial(self._digest, hash_alg=hash_alg)
+        info_digest = content_digest = b''
         if self.info:
             info_digest = digest(self.info.tobuf())
             if self.info.isfile():
@@ -233,12 +241,8 @@ class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
                         hook(self.info, file_handle)
             elif hook:
                 hook(self.info)
-                content_digest = b''
-            parts = [info_digest, content_digest] + [child.digest for child in children.values()]
-            digest = make_digest(sep.join(parts))
-        else:
-            digest = b''
-        return FileHashTree(self.info, children, digest)
+        digests = [info_digest, content_digest] + [child.digest for child in children.values()]
+        return FileHashTree(self.info, children, digest(sep.join(digests)))
 
     def __or__(self, other: typing.Optional['FileHashTree']) -> 'FileHashTree':
         """
@@ -301,6 +305,7 @@ class Backup:
     exclude: typing.Sequence[re.Pattern] = \
         dataclasses.field(default_factory=functools.partial(list, DEFAULT_EXCLUDE))
     file_types: set[str] = dataclasses.field(default_factory=set)
+    max_size: int = 32*GIBIBYTE
     timestamp: datetime.datetime = dataclasses.field(
         default_factory=lambda: datetime.datetime.utcnow().replace(microsecond=0))
     root: FileHashTree = dataclasses.field(default_factory=FileHashTree)
@@ -324,17 +329,19 @@ class Backup:
             'hash_alg': self.hash_alg,
             'compression': self.compression,
             'exclude': [pattern.pattern for pattern in self.exclude],
-            'file_types': sorted(self.file_types),
+            'type': sorted(self.file_types),
+            'max_size': self.max_size,
             'timestamp': self.fmt_timestamp,
             'root': self.root.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, data) -> 'Backup':
-        fields = {field: value for field in ('hash_alg', 'compression') if (value := data.get(field))}
+        fields = {field: value for field in ('hash_alg', 'compression', 'max_size')
+                  if (value := data.get(field))}
         if (exclude := data.get('exclude')) is not None:
             fields['exclude'] = tuple(map(re.compile, exclude))
-        if (file_types := data.get('file_types')) is not None:
+        if (file_types := data.get('type')) is not None:
             fields['file_types'] = set(file_types)
         if root := data.get('root'):
             fields['root'] = FileHashTree.from_dict(root)
@@ -400,20 +407,22 @@ class Archive:
     def open_tar(self, filename: str, mode: str):
         path = self.path / filename
         try:
-            with tarfile.open(path, mode) as tar:
+            with tarfile.open(str(path), mode) as tar:
                 yield tar
         except AbortException:
             if mode.startswith('w'):
                 path.unlink(missing_ok=True)
 
     @staticmethod
-    def bar_update_hook(bar: ProgressBar, info: tarfile.TarInfo,
-                        _file_handle: typing.Optional[io.FileIO] = None):
-        if info.size > 0:
-            bar.update(info)
+    def bar_update_hook(info: tarfile.TarInfo,
+                        _file_handle: typing.Optional[io.FileIO] = None,
+                        bar: typing.Optional[FileProgressBar] = None):
+        if bar and info.size > 0:
+            bar.update(pathlib.Path(info.name).name, info.size)
 
     def add_files(self, tar: tarfile.TarFile, diff: FileHashTree,
-                  bar: typing.Optional[ProgressBar] = None):
+                  bar: typing.Optional[FileProgressBar] = None):
+        update = functools.partial(self.bar_update_hook, bar=bar)
         for node in diff:
             if node.info:
                 path = FileHashTree.ROOT.joinpath(node.info.name)
@@ -422,8 +431,7 @@ class Archive:
                         tar.addfile(node.info, file_handle)
                 else:
                     tar.addfile(node.info)
-                if bar and node.info.size > 0:
-                    bar.update(node.info)
+                update(node.info)
 
     def find_backup(self, digest: bytes) -> typing.Optional[Backup]:
         for backup in reversed(self.metadata):
@@ -463,7 +471,8 @@ def filter_prefixes(sources: typing.Iterable[pathlib.Path]) \
 
 
 @click.group(context_settings={'max_content_width': 120})
-@click.option('--archive', default=str(pathlib.Path.cwd()), callback=as_path,
+@click.option('--archive', default=str(pathlib.Path.cwd()),
+              callback = lambda _ctx, path: pathlib.Path(path),
               type=click.Path(file_okay=False, exists=True),
               help='Directory the backups and metadata are written to.')
 @click.option('--confirm/--no-confirm', default=True,
@@ -503,8 +512,8 @@ def create(ctx, **options):
         backup = Backup.from_dict(options)
         with archive.open_tar(backup.tar_filename, 'w|' + backup.compression) as tar:
             backup.scan(tar, options['source'])
-            with ProgressBar(backup.root.size, slow_rate=96*MEBIBYTE, medium_rate=128*MEBIBYTE) as bar:
-                backup.digest(hook=functools.partial(Archive.bar_update_hook, bar))
+            with FileProgressBar(backup.root.size, slow_rate=96*MEBIBYTE, medium_rate=128*MEBIBYTE) as bar:
+                backup.digest(hook=functools.partial(Archive.bar_update_hook, bar=bar))
 
             click.secho(f'Scanned {len(backup.root)} files ({humanize_file_size(backup.root.size)}).',
                         fg='cyan', bold=True)
@@ -516,7 +525,7 @@ def create(ctx, **options):
             if diff := backup.root - base:
                 archive.write_metadata(backup)
                 click.echo(f'Wrote metadata to {backup.metadata_filename!r}')
-                with ProgressBar(diff.size) as bar:
+                with FileProgressBar(diff.size) as bar:
                     archive.add_files(tar, diff, bar)
                 click.secho(f'Added {len(diff)} modified files '
                             f'({humanize_file_size(diff.size)}) to archive.',
@@ -578,15 +587,19 @@ def restore(ctx, **options):
             click.secho(f'No backup found with digest: {digest.hex()!r}', fg='red', bold=True)
             return
         partitions = archive.partition(backup)
-        for backup in archive.metadata:
-            if targets := partitions.get(backup.root.digest):
-                with archive.open_tar(backup.tar_filename, 'r:*') as tar:
-                    mounted_targets = get_mounted_targets(tar, targets, options['mount'])
-                    for mounted_path, path, info in sorted(mounted_targets, reversed=True):
-                        if options['dry_run']:
-                            click.echo(f'{path!s} -> {mounted_path!s}')
-                        else:
-                            tar.extract(info, path=mounted_path.parent)
+        with contextlib.ExitStack() as stack:
+            x = {digest: stack.enter_context(archive.open_tar(backup.tar_filename, 'r:*'))
+                 for backup in archive.metadata if backup.root.digest in partitions}
+
+        # for backup in archive.metadata:
+        #     if targets := partitions.get(backup.root.digest):
+        #         with archive.open_tar(backup.tar_filename, 'r:*') as tar:
+        #             mounted_targets = get_mounted_targets(tar, targets, options['mount'])
+        #             for mounted_path, path, info in sorted(mounted_targets, reversed=True):
+        #                 if options['dry_run']:
+        #                     click.echo(f'{path!s} -> {mounted_path!s}')
+        #                 else:
+        #                     tar.extract(info, path=mounted_path.parent)
 
 
 @cli.command('list')
