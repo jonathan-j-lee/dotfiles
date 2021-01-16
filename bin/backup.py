@@ -6,33 +6,74 @@ import dataclasses
 import datetime
 import functools
 import hashlib
-import io
 import itertools
 import json
-import operator
-import pathlib
-import queue
+from pathlib import Path
+import re
 import tarfile
 import typing
-import re
 
 import click
 
 
-KIBIBYTE, MEBIBYTE, GIBIBYTE = 2**10, 2**20, 2**30
+ROOT = Path('/')
+BYTE_UNITS: dict[str, int] = {
+    'k': (KILOBYTE := 10**3),
+    'M': (MEGABYTE := 10**6),
+    'G': (GIGABYTE := 10**9),
+}
 
 
-def humanize_file_size(byte_count: int, rounding: int = 1) -> str:
-    """ Render a file size in bytes as text using human-readable units. """
-    prefixes = ['', 'Ki', 'Mi', 'Gi']
-    sizes = [1, KIBIBYTE, MEBIBYTE, GIBIBYTE, float('inf')]
-    for prefix, divisor, limit in zip(prefixes, sizes[:-1], sizes[1:]):
-        if byte_count < limit:
-            value = byte_count if divisor == 1 else round(byte_count/divisor, rounding)
-            return f'{value} {prefix}B'
+def parse_file_size(size: str) -> int:
+    """
+    Parse a string for a number of bytes, respecting SI prefixes.
+
+    >>> parse_file_size('100')
+    100
+    >>> parse_file_size('1k')
+    1000
+    >>> parse_file_size('1.1 M')
+    1100000
+    """
+    if size == 'inf':
+        return float('inf')
+    size = size.strip().removesuffix('B')
+    try:
+        return int(size)
+    except ValueError:
+        value, unit = float(size[:-1].strip()), size[-1]
+        return int(value*BYTE_UNITS[unit])
+
+
+def format_file_size(size: int, rounding: int = 1) -> str:
+    """
+    Format a number of bytes as a human-readable string using SI prefixes.
+
+    >>> format_file_size(100)
+    '100 B'
+    >>> format_file_size(1000)
+    '1.0 kB'
+    >>> format_file_size(1_001_000, rounding=3)
+    '1.001 MB'
+    """
+    units = {'': 1, **BYTE_UNITS}
+    prefixes, sizes = zip(*sorted(units.items(), key=lambda unit: unit[1]))
+    for prefix, divisor, limit in zip(prefixes, sizes, sizes[1:] + (float('inf'),)):
+        if size < limit:
+            if divisor > 1:
+                size = round(size/divisor, rounding)
+            return f'{size} {prefix}B'
 
 
 def format_duration(duration: datetime.timedelta) -> str:
+    """
+    Format a timedelta as a human-readable string in the HH:MM:SS format.
+
+    >>> format_duration(datetime.timedelta(seconds=5))
+    '0:00:05'
+    >>> format_duration(datetime.timedelta(hours=100, minutes=5, seconds=5))
+    '100:05:05'
+    """
     if duration == datetime.timedelta.max:
         return ':'.join(3*['--'])
     seconds = int(duration.total_seconds())
@@ -52,18 +93,19 @@ class FileProgressBar:
     width: int = 40
     fill_char: str = '#'
     empty_char: str = '.'
-    slow_rate: float = 8*MEBIBYTE  # About 0.533 GiB/min
-    medium_rate: float = 16*MEBIBYTE  # About 1.067 GiB/min
+    slow_rate: float = 8*MEGABYTE
+    medium_rate: float = 16*MEGABYTE
     rate_decay: float = 0.9
     bytes_processed: int = dataclasses.field(default=0, init=False, repr=False)
-    time_started: datetime.datetime = dataclasses.field(default=datetime.datetime.min, init=False, repr=False)
-    last_update: datetime.datetime = dataclasses.field(default=datetime.datetime.min, init=False, repr=False)
+    time_started: datetime.datetime = \
+        dataclasses.field(default=datetime.datetime.min, init=False, repr=False)
+    last_update: datetime.datetime = \
+        dataclasses.field(default=datetime.datetime.min, init=False, repr=False)
     current_rate: float = dataclasses.field(default=0, init=False, repr=False)
 
     def __enter__(self):
-        self.bytes_processed = 0
+        self.bytes_processed = self.current_rate = 0
         self.time_started = self.last_update = datetime.datetime.now()
-        self.current_rate = 0
         return self
 
     def __exit__(self, _exc_type, _exc, _tb):
@@ -98,7 +140,7 @@ class FileProgressBar:
             fg = 'yellow'
         else:
             fg = 'green'
-        return click.style(humanize_file_size(rate) + '/s', fg=fg, bold=True)
+        return click.style(format_file_size(rate) + '/s', fg=fg, bold=True)
 
     @property
     def eta(self) -> datetime.timedelta:
@@ -122,7 +164,7 @@ class FileProgressBar:
         rate = self.update_rate(size)
         filename = click.style(name, fg='cyan', bold=True)
         if size > 0:
-            filename += f' ({humanize_file_size(size)})'
+            filename += f' ({format_file_size(size)})'
         click.echo(' | '.join([
             f'[{full}{empty}] {percentage}',
             f'Runtime: {format_duration(self.duration)}, '
@@ -131,277 +173,373 @@ class FileProgressBar:
         ]) + '\r', nl=False)
 
 
-Exclude = typing.Callable[[pathlib.Path, tarfile.TarInfo], bool]
+class Mount(typing.NamedTuple):
+    src: Path
+    dst: typing.Optional[Path]
+    DELIMETER = ':'
+
+    @classmethod
+    def parse(cls, text) -> 'Mount':
+        src, dst = text.split(cls.DELIMETER)
+        return cls(Path(src), Path(dst) if dst else None)
+
+    def substitute(self, path: Path) -> typing.Optional[Path]:
+        try:
+            suffix = path.relative_to(self.src)
+        except ValueError:
+            return path
+        if self.dst:
+            return self.dst.joinpath(suffix)
+
+
+def make_option_parser(callback, exceptions: tuple[type] = (ValueError,)):
+    @functools.wraps(callback)
+    def wrapper(_ctx, value):
+        try:
+            if isinstance(value, tuple):
+                return tuple(map(callback, value))
+            return callback(value)
+        except exceptions as exc:
+            raise click.BadParameter(repr(value)) from exc
+    return wrapper
+
+
+def parse_permission(permissions: str) -> list[tuple[str, str, str]]:
+    if not (match := re.match(r'^([ugo]+)([\+\-])([rwx]+)$', permissions.lower())):
+        raise ValueError
+    owners, present, actions = match.groups()
+    return [(owner, present, action) for owner in owners for action in actions]
 
 
 @dataclasses.dataclass(frozen=True)
-class FileHashTree(collections.abc.Mapping[pathlib.Path, 'FileHashTree']):
+class FileFilter(typing.Callable[[tarfile.TarInfo], bool]):
     """
-    A recursive data structure containing file metadata and hashes to detect changes.
+    Filter files by their attributes (name, size, type, user/group, permissions, etc).
 
-    The hash digest at a node is dependent on the Tar info buffer, the file
-    contents (if the node is a regular file), and the digests of all the node's
-    children (if the node is a directory). The childrens' digests are ordered
-    by name to ensure the preimage is well-defined.
-
-    Attributes:
-        digest: The hash value. May be empty for non-archived files.
-        children: Maps names to child files. Only nonempty for directories.
-        info: An optional `tarfile.TarInfo` containing metadata written to a
-            Tar file. May be missing because the node represents a directory
-            not being archived, or because the tree is deserialized. Because
-            the Tar info is used to compute the digest, this field is not used
-            for comparison.
+    >>> path = Path('/var/log/pacman.log')
+    >>> info = tarfile.TarInfo(path)
+    >>> Filter = functools.partial(FileFilter, file_types=frozenset({'file', 'dir'}))
+    >>> Filter()(info)
+    True
+    >>> Filter(exclude_patterns=tuple(['*.log']))(info)
+    False
+    >>> Filter = functools.partial(Filter, users=frozenset({'me'}))
+    >>> Filter()(info)
+    False
+    >>> info.uname = 'me'
+    >>> Filter()(info)
+    True
     """
-    info: typing.Optional[tarfile.TarInfo] = \
-        dataclasses.field(default=None, repr=False, compare=False)
-    children: dict[str, 'FileHashTree'] = dataclasses.field(default_factory=dict)
-    digest: bytes = b''
+    mounts: tuple[Mount] = dataclasses.field(default_factory=tuple)
+    exclude_patterns: tuple[str] = dataclasses.field(default_factory=tuple)
+    max_size: int = float('inf')
+    file_types: tuple[str] = dataclasses.field(default_factory=tuple)
+    users: frozenset[str] = dataclasses.field(default_factory=frozenset)
+    groups: frozenset[str] = dataclasses.field(default_factory=frozenset)
+    permissions: frozenset[tuple[str, str, str]] = dataclasses.field(default_factory=frozenset)
+    min_mtime: datetime.datetime = datetime.datetime.min
+    max_mtime: datetime.datetime = datetime.datetime.max
 
-    ROOT: typing.ClassVar[pathlib.Path] = pathlib.Path('/')
+    _datetime_option = functools.partial(
+        click.option,
+        metavar='[YYYY-MM-DDTHH:MM:SS]',
+        callback=make_option_parser(datetime.datetime.fromisoformat),
+    )
+    OPTIONS = [
+        click.option('--mount', metavar='[SRC]:[DST]', multiple=True,
+                     callback=make_option_parser(Mount.parse), help='Alternate mount points.'),
+        click.option('--exclude', metavar='[PATTERN]', multiple=True,
+                     help='Glob-style pattern of files to exclude.'),
+        click.option('--max-size', default='inf', metavar='[SIZE]', show_default=True,
+                     callback=make_option_parser(parse_file_size, (ValueError, KeyError)),
+                     help='Maximum file size.'),
+        click.option('--type', default=['file', 'dir', 'sym'], multiple=True, show_default=True,
+                     type=click.Choice(['file', 'dir', 'sym', 'lnk', 'chr', 'blk', 'fifo']),
+                     help='File types to archive.'),
+        click.option('--user', multiple=True, help='Users owning files to operate on.'),
+        click.option('--group', multiple=True, help='Groups owning files to operate on.'),
+        click.option('--permission', metavar='[ugo][+-][rwx]', multiple=True,
+                     callback=make_option_parser(parse_permission),
+                     help='Permission bit constraints.'),
+        _datetime_option('--min-mtime', default=datetime.datetime.min.isoformat(),
+                         show_default=True, help='Minimum modified time.'),
+        _datetime_option('--max-mtime', default=datetime.datetime.max.isoformat(),
+                         show_default=True, help='Maximum modified time.'),
+    ]
 
     @classmethod
-    def _normalize_path(cls, path: typing.Union[str, pathlib.Path]) -> pathlib.Path:
-        if isinstance(path, str):
-            path = pathlib.Path(path)
-        return path.relative_to(cls.ROOT) if path.is_absolute() else path
+    def decorate(cls, fn):
+        for option in cls.OPTIONS:
+            fn = option(fn)
+        return fn
 
-    @staticmethod
-    def _digest(source: typing.Union[bytes, bytearray, io.FileIO],
-                chunk_size: int = 10*KIBIBYTE, hash_alg: str = 'sha256') -> bytes:
-        make_hash = getattr(hashlib, hash_alg)
-        if isinstance(source, (bytes, bytearray)):
-            hash_obj = make_hash(source)
+    @classmethod
+    def from_options(cls, **options) -> 'FileFilter':
+        return cls(
+            mounts=tuple(sorted(options['mount'], key=lambda mount: mount.src, reverse=True)),
+            exclude_patterns=options['exclude'],
+            max_size=options['max_size'],
+            file_types=options['type'],
+            users=frozenset(options['user']),
+            groups=frozenset(options['group']),
+            permissions=frozenset(sum(options['permission'], [])),
+            min_mtime=options['min_mtime'],
+            max_mtime=options['max_mtime'],
+        )
+
+    def get_mounted_path(self, path: Path) -> typing.Optional[Path]:
+        for mount in self.mounts:
+            try:
+                suffix = path.relative_to(mount.src)
+            except ValueError:
+                continue
+            else:
+                return mount.dst.joinpath(suffix) if mount.dst else None
+        return path
+
+    def allow_name(self, info: tarfile.TarInfo) -> bool:
+        path = ROOT.joinpath(info.name)
+        return not any(path.match(pattern) for pattern in self.exclude_patterns)
+
+    def allow_size(self, info: tarfile.TarInfo) -> bool:
+        return info.size <= self.max_size
+
+    def allow_type(self, info: tarfile.TarInfo) -> bool:
+        return any(getattr(info, f'is{file_type}')() for file_type in self.file_types)
+
+    def allow_ownership(self, info: tarfile.TarInfo) -> bool:
+        return not self.users or info.uname in self.users \
+            and not self.groups or info.gname in self.groups
+
+    def allow_permissions(self, info: tarfile.TarInfo) -> bool:
+        for owner, constraint, action in self.permissions:
+            shift = 3*'ogu'.index(owner) + 'xwr'.index(action)
+            if ((info.mode >> shift) & 1) != int(constraint == '+'):
+                return False
+        return True
+
+    def allow_mtime(self, info: tarfile.TarInfo) -> bool:
+        return self.min_mtime <= datetime.datetime.fromtimestamp(info.mtime) <= self.max_mtime
+
+    def __call__(self, info: tarfile.TarInfo) -> bool:
+        allow_checks = [self.allow_name, self.allow_size, self.allow_type,
+                        self.allow_ownership, self.allow_permissions, self.allow_mtime]
+        return all(allow(info) for allow in allow_checks)
+
+
+def compute_hash(*sources: typing.Union[typing.ByteString, typing.BinaryIO],
+                 hash_alg: str = 'sha256', buf_size: int = 10*KILOBYTE) -> str:
+    hash_obj = getattr(hashlib, hash_alg)()
+    for source in sources:
+        if isinstance(source, typing.ByteString):
+            hash_obj.update(source)
         else:
-            hash_obj, buf = make_hash(), bytearray(chunk_size)
+            buf = bytearray(buf_size)
             while source.readinto(buf):
                 hash_obj.update(buf)
-        return hash_obj.digest()
+    return hash_obj.hexdigest()
 
-    def __getitem__(self, path: typing.Union[str, pathlib.Path]) -> 'FileHashTree':
-        path = self._normalize_path(path)
+
+T = typing.TypeVar('T')
+PathLike = typing.Union[str, Path]
+
+@dataclasses.dataclass
+class FileTree(collections.abc.MutableMapping[PathLike, typing.Optional[T]]):
+    """
+    A nested dictionary that uses filesystem paths as keys.
+
+    >>> tree = FileTree()
+    >>> tree['a/b/c'] = 1
+    >>> len(tree)
+    4
+    >>> tree['a/b/d'] = 2
+    >>> tree['a/b'] is None
+    True
+    >>> sorted(tree) == [Path(), Path('a'), Path('a/b'), Path('a/b/c'), Path('a/b/d')]
+    True
+    >>> del tree['a/b']
+    >>> sorted(tree) == [Path(), Path('a')]
+    True
+    """
+    element: typing.Optional[T] = None
+    children: dict[str, 'FileTree'] = dataclasses.field(default_factory=dict)
+
+    @staticmethod
+    def _make_path_relative(path: PathLike) -> Path:
+        if isinstance(path, str):
+            path = Path(path)
+        return path.relative_to(ROOT) if path.is_absolute() else path
+
+    @staticmethod
+    def _split_path(path: Path) -> tuple[str, Path]:
+        name, *rest = path.parts
+        return name, Path().joinpath(*rest)
+
+    def __getitem__(self, path: PathLike) -> T:
+        path = self._make_path_relative(path)
         if not path.parts:
-            return self
-        name, *remainder = path.parts
-        return self.children[name][pathlib.Path().joinpath(*remainder)]
+            return self.element
+        name, path = self._split_path(path)
+        return self.children[name][path]
 
-    def __iter__(self):
-        yield self
-        for part, child in sorted(self.children.items()):
-            yield from child
+    def __setitem__(self, path: PathLike, element: T):
+        name, path = self._split_path(self._make_path_relative(path))
+        if (child := self.children.get(name)) is None:
+            child = self.children[name] = FileTree()
+        if not path.parts:
+            child.element = element
+        else:
+            child[path] = element
+
+    def __delitem__(self, path: PathLike):
+        name, path = self._split_path(self._make_path_relative(path))
+        if not path.parts:
+            del self.children[name]
+        else:
+            del self.children[name][path]
 
     def __len__(self) -> int:
-        return bool(self.info) + sum(map(len, self.children.values()))
+        return 1 + sum(map(len, self.children.values()))
 
-    def flatten(self, cwd: pathlib.Path = ROOT) -> typing.Mapping[pathlib.Path, 'FileHashTree']:
-        path_table = {cwd: self}
-        for part, child in sorted(self.children.items()):
-            path_table.update(child.flatten(cwd=cwd.joinpath(part)))
-        return path_table
+    def __iter__(self) -> typing.Iterable[Path]:
+        yield Path()
+        for name, child in sorted(self.children.items()):
+            for descendent in child:
+                yield name / descendent
 
-    @classmethod
-    def scan(cls, tar: tarfile.TarFile, path: pathlib.Path,
-             base: typing.Optional[pathlib.Path] = None,
-             exclude: typing.Optional[Exclude] = None) -> typing.Optional['FileHashTree']:
-        base = base or path
-        with contextlib.suppress(PermissionError):
-            if not path.exists() or not (info := tar.gettarinfo(path)):
-                return
-            if exclude and exclude(path, info):
-                return
-            node = FileHashTree(info)
-            if path.is_dir():
-                for child_path in path.iterdir():
-                    if child := FileHashTree.scan(tar, child_path, base=base, exclude=exclude):
-                        node.children[child_path.name] = child
-            if base == path:
-                for part in reversed(base.relative_to(cls.ROOT).parts):
-                    node = FileHashTree(children={part: node})
-            return node
-
-    @property
-    def size(self):
-        size = self.info.size if self.info else 0
-        return size + sum(child.size for child in self.children.values())
-
-    def with_digests(self, path: pathlib.Path = ROOT, hook=None,
-                     hash_alg: str = 'sha256', sep: bytes = b'|') -> 'FileHashTree':
-        children = {part: child.with_digests(path.joinpath(part), hook, hash_alg, sep)
-                    for part, child in sorted(self.children.items())}
-        digest = functools.partial(self._digest, hash_alg=hash_alg)
-        info_digest = content_digest = b''
-        if self.info:
-            info_digest = digest(self.info.tobuf())
-            if self.info.isfile():
-                with open(path, 'rb') as file_handle:
-                    content_digest = digest(file_handle)
-                    # File cache has been warmed up, so re-reading should not be too slow.
-                    if hook:
-                        file_handle.seek(0)
-                        hook(self.info, file_handle)
-            elif hook:
-                hook(self.info)
-        digests = [info_digest, content_digest] + [child.digest for child in children.values()]
-        return FileHashTree(self.info, children, digest(sep.join(digests)))
-
-    def __or__(self, other: typing.Optional['FileHashTree']) -> 'FileHashTree':
-        """
-        Merge two trees. The latest (right) operand takes precedence.
-
-        Some nodes may have blank digests because of new info/children combinations.
-        """
-        if not other:
-            return self
-        children = {part: (self.children.get(part) | other.children.get(part))
-                    for part in set(self.children) | set(other.children)}
-        return FileHashTree(other.info or self.info, children)
-
-    __ror__ = __or__
-
-    def __sub__(self, other: typing.Optional['FileHashTree']) -> typing.Optional['FileHashTree']:
-        if other is None:
-            return self
-        if self.digest != other.digest:
-            children = {part: diff for part, child in self.children.items()
-                        if (diff := child - other.children.get(part)) is not None}
-            return FileHashTree(self.info, children, self.digest)
-
-    def to_dict(self) -> dict:
-        node = {}
-        if digest := self.digest.hex():
-            node['digest'] = digest
-        if children := {part: child.to_dict() for part, child in self.children.items()}:
-            node['children'] = children
+    def to_dict(self, serialize=None):
+        node = {'elem': serialize(self.element) if serialize else self.element}
+        if self.children:
+            node['children'] = {name: child.to_dict(serialize=serialize)
+                                for name, child in self.children.items()}
         return node
 
     @classmethod
-    def from_dict(cls, data) -> 'FileHashTree':
-        children = data.get('children') or {}
-        return FileHashTree(
-            children={part: cls.from_dict(child) for part, child in children.items()},
-            digest=bytes.fromhex(data.get('digest', '')),
-        )
+    def from_dict(cls, node, deserialize=None) -> 'BackupIncrement':
+        element, children = node['elem'], node.get('children') or {}
+        return cls(element=(deserialize(element) if deserialize else element),
+                   children={name: cls.from_dict(child, deserialize=deserialize)
+                             for name, child in children.items()})
 
 
 @dataclasses.dataclass
-class Backup:
-    DEFAULT_EXCLUDE = [
-        r'^__pycache__$',                               # Python
-        r'\.pyc$',                                      # Python cache
-        r'^\.?(v|virtual|)envs?$',                      # Python virtual environments
-        r'^node_modules$',                              # NodeJS
-        r'^\.cache',                                    # Caches
-        r'^\.vagrant$',                                 # Vagrant
-        r'\.(aux|lof|fls|fdb_latexmk|pdfsync|toc)$',    # TeX
-        r'\.synctex(\.gz)?(\(busy\))?$',                # SyncTeX
-        r'^\.DS_Store$',                                # macOS
-    ]
+class BackupIncrement:
     HASH_ALGORITHMS = ('sha256', 'sha384', 'sha512')
     COMPRESSION_OPTIONS = ('none', 'gz', 'bz2', 'xz')
     TIMESTAMP_FORMAT = '%Y-%m-%dT%H%M%S'
+    METADATA_DIR_NAME = '.backup'
 
     hash_alg: str = HASH_ALGORITHMS[0]
     compression: str = COMPRESSION_OPTIONS[0]
-    exclude: typing.Sequence[re.Pattern] = \
-        dataclasses.field(default_factory=functools.partial(list, DEFAULT_EXCLUDE))
-    file_types: set[str] = dataclasses.field(default_factory=set)
-    max_size: int = 32*GIBIBYTE
-    timestamp: datetime.datetime = dataclasses.field(
-        default_factory=lambda: datetime.datetime.utcnow().replace(microsecond=0))
-    root: FileHashTree = dataclasses.field(default_factory=FileHashTree)
+    timestamp: datetime.datetime = \
+        dataclasses.field(default_factory=datetime.datetime.utcnow)
+    size: int = 0
+    root: FileTree[typing.ByteString] = dataclasses.field(default_factory=FileTree)
+    prev: typing.Optional['BackupIncrement'] = None
 
     def __post_init__(self):
-        self.file_types.update({'file', 'dir'})
         if self.compression == 'none':
             self.compression = ''
 
-    def should_exclude(self, path: pathlib.Path, info: tarfile.TarInfo) -> bool:
-        if any(pattern.search(path.name) for pattern in self.exclude):
-            return True
-        return not any(getattr(info, f'is{file_type}')() for file_type in self.file_types)
-
-    @functools.cached_property
+    @property
     def fmt_timestamp(self) -> str:
         return self.timestamp.strftime(self.TIMESTAMP_FORMAT)
 
-    def to_dict(self) -> dict:
-        return {
-            'hash_alg': self.hash_alg,
-            'compression': self.compression,
-            'exclude': [pattern.pattern for pattern in self.exclude],
-            'type': sorted(self.file_types),
-            'max_size': self.max_size,
-            'timestamp': self.fmt_timestamp,
-            'root': self.root.to_dict(),
-        }
-
-    @classmethod
-    def from_dict(cls, data) -> 'Backup':
-        fields = {field: value for field in ('hash_alg', 'compression', 'max_size')
-                  if (value := data.get(field))}
-        if (exclude := data.get('exclude')) is not None:
-            fields['exclude'] = tuple(map(re.compile, exclude))
-        if (file_types := data.get('type')) is not None:
-            fields['file_types'] = set(file_types)
-        if root := data.get('root'):
-            fields['root'] = FileHashTree.from_dict(root)
-        if timestamp := data.get('timestamp'):
-            fields['timestamp'] = datetime.datetime.strptime(timestamp, cls.TIMESTAMP_FORMAT)
-        return Backup(**fields)
-
-    def scan(self, tar: tarfile.TarFile, sources: typing.Sequence[pathlib.Path]):
-        trees = (FileHashTree.scan(tar, source, exclude=self.should_exclude)
-                 for source in filter_prefixes(sources))
-        self.root = functools.reduce(operator.or_, trees, self.root)
-
-    def digest(self, *args, **kwargs):
-        self.root = self.root.with_digests(*args, hash_alg=self.hash_alg, **kwargs)
-
-    @functools.cached_property
+    @property
     def tar_filename(self) -> str:
         filename = f'{self.fmt_timestamp}-backup.tar'
         return filename + '.' + self.compression if self.compression else filename
 
-    @functools.cached_property
+    @property
     def metadata_filename(self) -> str:
         return f'{self.fmt_timestamp}-metadata.json'
 
+    @property
+    def signature(self) -> str:
+        return compute_hash(*(f'{ROOT.joinpath(path)}:{digest}'.encode()
+                              for path, digest in self.root.items() if digest))
 
-@dataclasses.dataclass(frozen=True)
-class Archive:
-    path: pathlib.Path
-    metadata: list[Backup] = dataclasses.field(default_factory=list, init=False, repr=False)
+    def scan(self, tar: tarfile.TarFile, file_filter: FileFilter, source: Path) \
+            -> typing.Iterable[tuple[Path, tarfile.TarInfo]]:
+        if mounted_path := file_filter.get_mounted_path(source):
+            info = tar.gettarinfo(source, mounted_path)
+            if file_filter(info):
+                self.size += info.size
+                yield source, info
+                if source.is_dir():
+                    for child in source.iterdir():
+                        yield from self.scan(tar, file_filter, child)
 
-    METADATA_DIR_NAME = '.backup'
+    def scan_chain(self, tar: tarfile.TarFile, file_filter: FileFilter,
+                   *sources: Path) -> list[tarfile.TarInfo]:
+        scans = (self.scan(tar, file_filter, source) for source in filter_prefixes(sources))
+        return list(itertools.chain(*scans))
 
-    @functools.cached_property
-    def _metadata_path(self) -> pathlib.Path:
-        return self.path / self.METADATA_DIR_NAME
+    def get_last_hash(self, path: Path) -> typing.Optional[str]:
+        current = self
+        while current := current.prev:
+            if digest := current.root.get(path):
+                return digest
+
+    def add(self, tar: tarfile.TarFile, path: Path, info: tarfile.TarInfo):
+        last_hash = self.get_last_hash(path)
+        cm = open(path, 'rb') if path.is_file() else contextlib.nullcontext()
+        with cm as handle:
+            buf = [handle] if handle else []
+            digest = compute_hash(info.tobuf(), *buf, hash_alg=self.hash_alg)
+            if digest != self.get_last_hash(path):
+                if handle:
+                    handle.seek(0)  # File cache should be warmed up.
+                    tar.addfile(info, handle)
+                else:
+                    tar.addfile(info)
+        self.root[path] = digest
+
+
+@dataclasses.dataclass
+class Backup:
+    path: Path
+    last: typing.Optional[BackupIncrement] = None
 
     @property
-    def last_backup(self) -> typing.Optional[Backup]:
-        if self.metadata:
-            return self.metadata[-1]
+    def _metadata_path(self) -> Path:
+        return self.path / '.backup'
 
-    def read_metadata(self, path: pathlib.Path):
-        with open(path) as metadata_file:
-            backup = Backup.from_dict(json.load(metadata_file))
-            if backup.root.digest:
-                self.metadata.append(backup)
+    def read_metadata(self, filename: str) -> BackupIncrement:
+        with open(self._metadata_path / filename) as metadata_file:
+            metadata = json.load(metadata_file)
+        return BackupIncrement(
+            hash_alg=metadata['hash_alg'],
+            compression=metadata['compression'],
+            timestamp=datetime.datetime.fromisoformat(metadata['timestamp']),
+            size=metadata['size'],
+            root=FileTree.from_dict(metadata['root']),
+        )
 
-    def write_metadata(self, backup: Backup):
-        with open(self._metadata_path / backup.metadata_filename, 'w+') as metadata_file:
-            json.dump(backup.to_dict(), metadata_file, separators=(',', ':'))
+    def write_metadata(self, filename: str, increment: BackupIncrement):
+        with open(self._metadata_path / filename, 'w+') as metadata_file:
+            metadata = {
+                'hash_alg': increment.hash_alg,
+                'compression': increment.compression,
+                'timestamp': increment.timestamp.isoformat(),
+                'size': increment.size,
+                'root': increment.root.to_dict(),
+            }
+            json.dump(metadata, metadata_file, separators=(',', ':'))
+
+    def push(self, increment: BackupIncrement) -> BackupIncrement:
+        self.last, increment.prev = increment, self.last
+        return increment
 
     def __enter__(self):
         self._metadata_path.mkdir(parents=True, exist_ok=True)
-        for path in sorted(self._metadata_path.iterdir()):
-            self.read_metadata(path)
-        self.metadata.sort(key = lambda backup: backup.timestamp)
+        increments = [self.read_metadata(path.name) for path in self._metadata_path.iterdir()]
+        for increment in sorted(increments, key=lambda increment: increment.timestamp):
+            self.push(increment)
         return self
 
     def __exit__(self, _exc, _exc_type, _tb):
-        self.metadata.clear()
+        self.last = None
 
     @contextlib.contextmanager
     def open_tar(self, filename: str, mode: str):
@@ -413,49 +551,8 @@ class Archive:
             if mode.startswith('w'):
                 path.unlink(missing_ok=True)
 
-    @staticmethod
-    def bar_update_hook(info: tarfile.TarInfo,
-                        _file_handle: typing.Optional[io.FileIO] = None,
-                        bar: typing.Optional[FileProgressBar] = None):
-        if bar and info.size > 0:
-            bar.update(pathlib.Path(info.name).name, info.size)
 
-    def add_files(self, tar: tarfile.TarFile, diff: FileHashTree,
-                  bar: typing.Optional[FileProgressBar] = None):
-        update = functools.partial(self.bar_update_hook, bar=bar)
-        for node in diff:
-            if node.info:
-                path = FileHashTree.ROOT.joinpath(node.info.name)
-                if node.info.isfile():
-                    with open(path, 'rb') as file_handle:
-                        tar.addfile(node.info, file_handle)
-                else:
-                    tar.addfile(node.info)
-                update(node.info)
-
-    def find_backup(self, digest: bytes) -> typing.Optional[Backup]:
-        for backup in reversed(self.metadata):
-            if backup.root.digest == digest:
-                return backup
-
-    def partition(self, backup: Backup) -> typing.Mapping[bytes, typing.Set[pathlib.Path]]:
-        targets, partitions = backup.root.flatten(), collections.defaultdict(set)
-        sentinel = FileHashTree()
-        for base, current in list(zip([None] + self.metadata[:-1], self.metadata))[::-1]:
-            if (diff := current.root - (base.root if base else None)) is not None:
-                for path, node in diff.flatten().items():
-                    if any(path in paths for paths in partitions.values()):
-                        continue
-                    if node.digest == targets.get(path, sentinel).digest:
-                        partitions[current.root.digest].add(path)
-                        del targets[path]
-        if targets:
-            raise ValueError('Not all files found in backups')
-        return partitions
-
-
-def filter_prefixes(sources: typing.Iterable[pathlib.Path]) \
-        -> typing.Iterable[pathlib.Path]:
+def filter_prefixes(sources: typing.Iterable[Path]) -> typing.Iterable[Path]:
     """
     Filter a list of paths such that no path is a prefix of any other.
 
@@ -470,19 +567,16 @@ def filter_prefixes(sources: typing.Iterable[pathlib.Path]) \
             yield (current_path := next_path)
 
 
-@click.group(context_settings={'max_content_width': 120})
-@click.option('--archive', default=str(pathlib.Path.cwd()),
-              callback = lambda _ctx, path: pathlib.Path(path),
+@click.group(context_settings=dict(max_content_width=120))
+@click.option('--archive', default=str(Path.cwd()), callback=make_option_parser(Path),
               type=click.Path(file_okay=False, exists=True),
-              help='Directory the backups and metadata are written to.')
+              help='Directory to write the backups to.')
 @click.option('--confirm/--no-confirm', default=True,
-              help='Toggle confirmation prompts of critical tasks.')
-@click.version_option(version='0.0.1', message='v%(version)s')
+              help='Toggle confirmation of critical tasks.')
+@click.version_option(version='1.0.0', message='v%(version)s')
 @click.pass_context
 def cli(ctx, **options):
-    """
-    Create incremental compressed backups.
-    """
+    """ Manage incremental compressed backups. """
     ctx.ensure_object(dict)
     ctx.obj.update(options)
     if not options['confirm']:
@@ -491,128 +585,68 @@ def cli(ctx, **options):
 
 # TODO: consider encryption/signing archives.
 @cli.command()
-@click.option('--compression', default=Backup.COMPRESSION_OPTIONS[0], show_default=True,
-              type=click.Choice(Backup.COMPRESSION_OPTIONS), help='Compression method.')
-@click.option('--hash-alg', default=Backup.HASH_ALGORITHMS[0],
-              type=click.Choice(Backup.HASH_ALGORITHMS),
-              help='Hashing algorithm used to check file equality.')
-@click.option('--type', default=['sym'], show_default=True, multiple=True,
-              type=click.Choice(['sym', 'lnk', 'chr', 'blk', 'fifo']),
-              help='Special file types to archive.')
-@click.option('--exclude', metavar='[PATTERN]', default=Backup.DEFAULT_EXCLUDE,
-              multiple=True, help='Regular expression of files to exclude.')
-@click.option('--max-size', type=int, default=100*MEBIBYTE,
-              help='Maximum file size. [default: 100 MiB]')
+@click.option('--compression', default=BackupIncrement.COMPRESSION_OPTIONS[0],
+              show_default=True, type=click.Choice(BackupIncrement.COMPRESSION_OPTIONS),
+              help='Archive compression method.')
+@click.option('--hash-alg', default=BackupIncrement.HASH_ALGORITHMS[0],
+              show_default=True, type=click.Choice(BackupIncrement.HASH_ALGORITHMS),
+              help='Hashing algorithm for checking file equality.')
+@FileFilter.decorate
 @click.argument('source', nargs=-1, type=click.Path(exists=True),
-                callback = lambda _ctx, values: tuple(map(pathlib.Path, values)))
+                callback=make_option_parser(Path))
 @click.pass_context
 def create(ctx, **options):
-    """ Create a backup. """
-    with Archive(ctx.obj['archive']) as archive:
-        backup = Backup.from_dict(options)
-        with archive.open_tar(backup.tar_filename, 'w|' + backup.compression) as tar:
-            backup.scan(tar, options['source'])
-            with FileProgressBar(backup.root.size, slow_rate=96*MEBIBYTE, medium_rate=128*MEBIBYTE) as bar:
-                backup.digest(hook=functools.partial(Archive.bar_update_hook, bar=bar))
-
-            click.secho(f'Scanned {len(backup.root)} files ({humanize_file_size(backup.root.size)}).',
+    with Backup(ctx.obj['archive']) as backup:
+        increment = backup.push(BackupIncrement(options['hash_alg'], options['compression']))
+        file_filter = FileFilter.from_options(**options)
+        with backup.open_tar(increment.tar_filename, 'w|' + increment.compression) as tar:
+            infos = increment.scan_chain(tar, file_filter, *options['source'])
+            click.secho(f'Scanned {len(infos)} files ({format_file_size(increment.size)})',
                         fg='cyan', bold=True)
-            click.echo(f'Ready to write archive to {backup.tar_filename!r}.')
+            click.echo(f'Ready to write archive to {increment.tar_filename!r}')
             if not click.confirm('Commit to disk?'):
                 raise AbortException
 
-            base = last.root if (last := archive.last_backup) else None
-            if diff := backup.root - base:
-                archive.write_metadata(backup)
-                click.echo(f'Wrote metadata to {backup.metadata_filename!r}')
-                with FileProgressBar(diff.size) as bar:
-                    archive.add_files(tar, diff, bar)
-                click.secho(f'Added {len(diff)} modified files '
-                            f'({humanize_file_size(diff.size)}) to archive.',
-                            fg='green', bold=True)
-            else:
-                click.secho('No modified files to archive.', fg='yellow', bold=True)
+            with FileProgressBar(increment.size) as bar:
+                for path, info in infos:
+                    increment.add(tar, path, info)
+                    if info.size > 0:
+                        bar.update(Path(info.name).name, info.size)
+            signature = increment.signature
+            if increment.prev and increment.prev.signature == signature:
+                click.secho('No modified files to archive', fg='yellow', bold=True)
                 raise AbortException
+            backup.write_metadata(increment.metadata_filename, increment)
+            click.echo(f'Wrote metadata to {increment.metadata_filename!r}')
+            click.secho(f'Backup created (signature: {signature})', fg='green', bold=True)
 
 
-def parse_hash(_ctx, value: typing.Optional[str]) -> bytes:
-    try:
-        return bytes.fromhex(value or '')
-    except ValueError as exc:
-        raise click.BadParameter(f'Hash is not a hexadecimal string: {value!r}') from exc
-
-
-hash_argument = click.argument('hash', required=False, callback=parse_hash)
-Mount = tuple[pathlib.Path, typing.Optional[pathlib.Path]]
-
-
-def parse_mounts(_ctx, values: tuple[str, ...]) -> list[Mount]:
-    mounts = []
-    for mount in values:
-        src, dst = mount.split(':')
-        mounts.append((pathlib.Path(src), pathlib.Path(dst) if dst else None))
-    return mounts
-
-
-def substitute_mounts(path: pathlib.Path, mounts: list[Mount]) -> typing.Optional[pathlib.Path]:
-    for src, dst in mounts:
-        if path.is_relative_to(src):
-            return dst.joinpath(path.relative_to(src)) if dst else None
-    return path
-
-
-def get_mounted_targets(tar: tarfile.TarFile, targets: set[pathlib.Path], mounts: list[Mount]) \
-        -> typing.Iterable[tuple[pathlib.Path, pathlib.Path, tarfile.TarInfo]]:
-    for info in tar:
-        path = FileHashTree.ROOT.joinpath(info.name)
-        if path in targets and (mounted_path := substitute_mounts(path, mounts)):
-            info.name = mounted_path.name
-            yield mounted_path, path, info
+hash_argument = click.argument('hash', required=False,
+    callback=make_option_parser(lambda digest: bytes.fromhex(digest or '')))
 
 
 @cli.command()
-@click.option('--dry-run', is_flag=True, help='Do not persist changes.')
-@click.option('--destructive', is_flag=True, help='Destroy existing files.')
-@click.option('--mount', metavar='[SRC]:[DST]', callback=parse_mounts,
-              multiple=True, help='Alternate mount points.')
+@FileFilter.decorate
 @hash_argument
-@click.pass_context
 def restore(ctx, **options):
-    """ Restore a backup. """
-    with Archive(ctx.obj['archive']) as archive:
-        if not (last := archive.last_backup):
-            click.secho('No backups available.', fg='red', bold=True)
-            return
-        if not (backup := archive.find_backup(digest := options['hash'] or last.root.digest)):
-            click.secho(f'No backup found with digest: {digest.hex()!r}', fg='red', bold=True)
-            return
-        partitions = archive.partition(backup)
-        with contextlib.ExitStack() as stack:
-            x = {digest: stack.enter_context(archive.open_tar(backup.tar_filename, 'r:*'))
-                 for backup in archive.metadata if backup.root.digest in partitions}
-
-        # for backup in archive.metadata:
-        #     if targets := partitions.get(backup.root.digest):
-        #         with archive.open_tar(backup.tar_filename, 'r:*') as tar:
-        #             mounted_targets = get_mounted_targets(tar, targets, options['mount'])
-        #             for mounted_path, path, info in sorted(mounted_targets, reversed=True):
-        #                 if options['dry_run']:
-        #                     click.echo(f'{path!s} -> {mounted_path!s}')
-        #                 else:
-        #                     tar.extract(info, path=mounted_path.parent)
+    file_filter = FileFilter.from_options(**options)
 
 
 @cli.command('list')
 @click.pass_context
 def list_backups(ctx):
     """ List available backups. """
-    with Archive(ctx.obj['archive']) as archive:
-        if archive.metadata:
+    with Backup(ctx.obj['archive']) as backup:
+        if current := backup.last:
             click.secho('Backups:', bold=True)
-            for backup in archive.metadata:
-                click.echo(f'  {backup.fmt_timestamp} {backup.hash_alg} {backup.root.digest.hex()}')
+            while current:
+                columns = [current.fmt_timestamp, current.hash_alg,
+                           current.compression, current.signature,
+                           format_file_size(current.size)]
+                click.echo(f'  {" ".join(columns)}')
+                current = current.prev
         else:
-            click.secho('No backups found.', fg='yellow', bold=True)
+            click.secho('No backups found', fg='yellow', bold=True)
 
 
 @cli.command()
