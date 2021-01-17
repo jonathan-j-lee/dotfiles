@@ -1,0 +1,3 @@
+#!/bin/bash
+
+bin/backup.py --archive=/tmp/archive list

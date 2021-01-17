@@ -155,6 +155,8 @@ class FileProgressBar:
         click.echo(' '*width + '\r', nl=False)
 
     def update(self, name: str, size: int = 0):
+        if size == 0:   # Can result in screen flicker
+            return
         self.clear()
         self.bytes_processed += size
         full = self.fill_char*int(self.width*self.progress)
@@ -321,10 +323,10 @@ class FileFilter(typing.Callable[[tarfile.TarInfo], bool]):
     def allow_mtime(self, info: tarfile.TarInfo) -> bool:
         return self.min_mtime <= datetime.datetime.fromtimestamp(info.mtime) <= self.max_mtime
 
-    def __call__(self, info: tarfile.TarInfo) -> bool:
+    def __call__(self, info: typing.Optional[tarfile.TarInfo]) -> bool:
         allow_checks = [self.allow_name, self.allow_size, self.allow_type,
                         self.allow_ownership, self.allow_permissions, self.allow_mtime]
-        return all(allow(info) for allow in allow_checks)
+        return info and all(allow(info) for allow in allow_checks)
 
 
 def compute_hash(*sources: typing.Union[typing.ByteString, typing.BinaryIO],
@@ -441,6 +443,14 @@ class BackupIncrement:
         if self.compression == 'none':
             self.compression = ''
 
+    def __iter__(self) -> typing.Iterable['BackupIncrement']:
+        yield self
+        if self.prev:
+            yield from self.prev
+
+    def __len__(self) -> int:
+        return 1 + (0 if self.prev is None else len(self.prev))
+
     @property
     def fmt_timestamp(self) -> str:
         return self.timestamp.strftime(self.TIMESTAMP_FORMAT)
@@ -475,11 +485,11 @@ class BackupIncrement:
         scans = (self.scan(tar, file_filter, source) for source in filter_prefixes(sources))
         return list(itertools.chain(*scans))
 
-    def get_last_hash(self, path: Path) -> typing.Optional[str]:
-        current = self
-        while current := current.prev:
-            if digest := current.root.get(path):
-                return digest
+    def get_last_hash(self, path: PathLike) -> typing.Optional[str]:
+        if self.prev is not None:
+            for increment in self.prev:
+                if digest := increment.root.get(path):
+                    return digest
 
     def add(self, tar: tarfile.TarFile, path: Path, info: tarfile.TarInfo):
         last_hash = self.get_last_hash(path)
@@ -487,18 +497,23 @@ class BackupIncrement:
         with cm as handle:
             buf = [handle] if handle else []
             digest = compute_hash(info.tobuf(), *buf, hash_alg=self.hash_alg)
-            if digest != self.get_last_hash(path):
+            if digest != self.get_last_hash(info.name):
                 if handle:
                     handle.seek(0)  # File cache should be warmed up.
                     tar.addfile(info, handle)
                 else:
                     tar.addfile(info)
-        self.root[path] = digest
+        self.root[info.name] = digest
 
 
 @dataclasses.dataclass
 class Backup:
+    """
+    A backup storage layer for reading and writing metadata and TARs.
+    """
     path: Path
+    stack: contextlib.ExitStack = dataclasses.field(default_factory=contextlib.ExitStack)
+    tars: dict[str, tarfile.TarFile] = dataclasses.field(default_factory=dict)
     last: typing.Optional[BackupIncrement] = None
 
     @property
@@ -528,6 +543,7 @@ class Backup:
             json.dump(metadata, metadata_file, separators=(',', ':'))
 
     def push(self, increment: BackupIncrement) -> BackupIncrement:
+        """ Push a new backup increment into the history. """
         self.last, increment.prev = increment, self.last
         return increment
 
@@ -536,20 +552,56 @@ class Backup:
         increments = [self.read_metadata(path.name) for path in self._metadata_path.iterdir()]
         for increment in sorted(increments, key=lambda increment: increment.timestamp):
             self.push(increment)
+        self.stack = self.stack.__enter__()
         return self
 
-    def __exit__(self, _exc, _exc_type, _tb):
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.stack.__exit__(exc_type, exc, tb)
         self.last = None
+        if exc_type:
+            for filename, tar in self.tars.items():
+                if tar.mode.startswith('w'):
+                    (self.path / filename).unlink(missing_ok=True)
+        return exc_type is AbortException
 
-    @contextlib.contextmanager
-    def open_tar(self, filename: str, mode: str):
-        path = self.path / filename
-        try:
-            with tarfile.open(str(path), mode) as tar:
-                yield tar
-        except AbortException:
-            if mode.startswith('w'):
-                path.unlink(missing_ok=True)
+    def get_tar(self, increment: BackupIncrement, mode: str) -> tarfile.TarFile:
+        tar = self.tars.get(filename := increment.tar_filename)
+        if not tar:
+            tar = tarfile.open(str(self.path / filename), mode)
+            tar = self.tars[filename] = self.stack.enter_context(tar)
+        return tar
+
+    def get_increment(self, signature: bytes) -> typing.Optional[BackupIncrement]:
+        if signature and self.last is not None:
+            for increment in self.last:
+                if increment.signature == signature:
+                    return increment
+        else:
+            return self.last
+
+    def find_tar(self, path: Path, last: typing.Optional[BackupIncrement] = None) \
+            -> typing.Optional[tuple[tarfile.TarInfo, tarfile.TarInfo]]:
+        if last is None:
+            last = self.last
+        for increment in last:
+            tar = self.get_tar(increment, 'r:*')
+            with contextlib.suppress(KeyError):
+                return tar.getmember(str(path))
+
+    def extract(self, last: BackupIncrement, file_filter: FileFilter, path: Path) -> int:
+        for increment in last:
+            tar = self.get_tar(increment, 'r:*')
+            try:
+                info = tar.getmember(str(path))
+            except KeyError:
+                continue
+            path = ROOT.joinpath(path)
+            if not (mounted_path := file_filter.get_mounted_path(path)) or not file_filter(info):
+                return info.size
+            mounted_path, info.name = mounted_path.parent, mounted_path.name
+            tar.extract(info, mounted_path)
+            return info.size
+        raise ValueError('File not found')
 
 
 def filter_prefixes(sources: typing.Iterable[Path]) -> typing.Iterable[Path]:
@@ -567,16 +619,25 @@ def filter_prefixes(sources: typing.Iterable[Path]) -> typing.Iterable[Path]:
             yield (current_path := next_path)
 
 
-@click.group(context_settings=dict(max_content_width=120))
+@click.group(context_settings=dict(max_content_width=100))
 @click.option('--archive', default=str(Path.cwd()), callback=make_option_parser(Path),
               type=click.Path(file_okay=False, exists=True),
               help='Directory to write the backups to.')
 @click.option('--confirm/--no-confirm', default=True,
               help='Toggle confirmation of critical tasks.')
+@click.option('--dry-run', is_flag=True, help='Do not persist changes.')
 @click.version_option(version='1.0.0', message='v%(version)s')
 @click.pass_context
 def cli(ctx, **options):
-    """ Manage incremental compressed backups. """
+    """
+    Manage incremental compressed backups.
+
+    This tool stores each backup as a pair of files: a metadata file (JSON) and
+    a possibly compressed tar. The metadata records a hash of each backed-up
+    file's attributes and contents. The tar only contains backed-up files that
+    have been added or modified since the last backup, reducing the time and
+    space needed to back up largely unmodified file trees.
+    """
     ctx.ensure_object(dict)
     ctx.obj.update(options)
     if not options['confirm']:
@@ -596,40 +657,55 @@ def cli(ctx, **options):
                 callback=make_option_parser(Path))
 @click.pass_context
 def create(ctx, **options):
+    """
+    Create a backup.
+    """
     with Backup(ctx.obj['archive']) as backup:
         increment = backup.push(BackupIncrement(options['hash_alg'], options['compression']))
+        tar = backup.get_tar(increment, 'w|' + increment.compression)
         file_filter = FileFilter.from_options(**options)
-        with backup.open_tar(increment.tar_filename, 'w|' + increment.compression) as tar:
-            infos = increment.scan_chain(tar, file_filter, *options['source'])
-            click.secho(f'Scanned {len(infos)} files ({format_file_size(increment.size)})',
-                        fg='cyan', bold=True)
-            click.echo(f'Ready to write archive to {increment.tar_filename!r}')
-            if not click.confirm('Commit to disk?'):
-                raise AbortException
+        infos = increment.scan_chain(tar, file_filter, *options['source'])
+        click.secho(f'Scanned {len(infos)} files ({format_file_size(increment.size)}).',
+                    fg='cyan', bold=True)
+        click.echo(f'Ready to write archive to {increment.tar_filename!r}.')
+        if not click.confirm('Commit to disk?'):
+            raise AbortException
 
-            with FileProgressBar(increment.size) as bar:
-                for path, info in infos:
-                    increment.add(tar, path, info)
-                    if info.size > 0:
-                        bar.update(Path(info.name).name, info.size)
-            signature = increment.signature
-            if increment.prev and increment.prev.signature == signature:
-                click.secho('No modified files to archive', fg='yellow', bold=True)
-                raise AbortException
-            backup.write_metadata(increment.metadata_filename, increment)
-            click.echo(f'Wrote metadata to {increment.metadata_filename!r}')
-            click.secho(f'Backup created (signature: {signature})', fg='green', bold=True)
-
-
-hash_argument = click.argument('hash', required=False,
-    callback=make_option_parser(lambda digest: bytes.fromhex(digest or '')))
+        with FileProgressBar(increment.size) as bar:
+            for path, info in infos:
+                increment.add(tar, path, info)
+                bar.update(Path(info.name).name, info.size)
+        signature = increment.signature
+        if increment.prev and increment.prev.signature == signature:
+            click.secho('No modified files to archive.', fg='yellow', bold=True)
+            raise AbortException
+        backup.write_metadata(increment.metadata_filename, increment)
+        click.echo(f'Wrote metadata to {increment.metadata_filename!r}.')
+        click.secho(f'Backup created (signature: {signature}).', fg='green', bold=True)
 
 
 @cli.command()
 @FileFilter.decorate
-@hash_argument
+@click.argument('hash', required=False)
+@click.pass_context
 def restore(ctx, **options):
-    file_filter = FileFilter.from_options(**options)
+    """
+    Restore a backup.
+    """
+    with Backup(ctx.obj['archive']) as backup:
+        if not (increment := backup.get_increment(signature := options['hash'])):
+            if signature:
+                message = f'No backup found with signature: {signature!r}.'
+            else:
+                message = 'No backups available.'
+            click.secho(message, fg='red', bold=True)
+            return
+        file_filter = FileFilter.from_options(**options)
+        with FileProgressBar(increment.size) as bar:
+            paths = list(filter(increment.root.get, increment.root))
+            for path in reversed(paths):
+                size = backup.extract(increment, file_filter, path)
+                bar.update(path.name, size)
 
 
 @cli.command('list')
@@ -637,20 +713,19 @@ def restore(ctx, **options):
 def list_backups(ctx):
     """ List available backups. """
     with Backup(ctx.obj['archive']) as backup:
-        if current := backup.last:
+        if backup.last is not None:
             click.secho('Backups:', bold=True)
-            while current:
-                columns = [current.fmt_timestamp, current.hash_alg,
-                           current.compression, current.signature,
-                           format_file_size(current.size)]
+            for increment in backup.last:
+                columns = [increment.fmt_timestamp, increment.hash_alg,
+                           increment.compression, increment.signature,
+                           format_file_size(increment.size)]
                 click.echo(f'  {" ".join(columns)}')
-                current = current.prev
         else:
-            click.secho('No backups found', fg='yellow', bold=True)
+            click.secho('No backups found.', fg='yellow', bold=True)
 
 
 @cli.command()
-@hash_argument
+@click.argument('hash', required=False)
 @click.pass_context
 def remove(ctx):
     """ Remove and merge a backup. """

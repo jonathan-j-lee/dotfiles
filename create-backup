@@ -1,0 +1,24 @@
+#!/bin/bash
+
+set -x
+bin/backup.py --archive /tmp/archive create $@ \
+  --compression=gz \
+  --exclude=__pycache__ \
+  --exclude=*.pyc \
+  --exclude=.v*env* \
+  --exclude=node_modules \
+  --exclude=.cache \
+  --exclude=.vagrant \
+  --exclude=*.synctex* \
+  --exclude=.DS_Store \
+  --exclude=*.aux \
+  --exclude=*.lof \
+  --exclude=*.fls \
+  --exclude=*.fdb_latexmk \
+  --exclude=*.pdfsync \
+  --exclude=*.toc \
+  --mount ${HOME}:/ \
+  --mount ${HOME}/uc-berkeley/2016-fall/math-53: \
+  ~/uc-berkeley/2016-fall \
+  /var/log/pacman.log \
+  ~/uc-berkeley/2016-fall/cs-61a

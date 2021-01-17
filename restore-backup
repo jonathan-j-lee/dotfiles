@@ -1,0 +1,4 @@
+#!/bin/bash
+
+set -x
+bin/backup.py --archive=/tmp/archive restore --mount /:/tmp/archive/test --exclude=*.py --exclude=*.pdf --exclude=*ok* $@
