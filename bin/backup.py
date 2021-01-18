@@ -368,12 +368,14 @@ class FileTree(collections.abc.MutableMapping[PathLike, typing.Optional[T]]):
 
     @staticmethod
     def _make_path_relative(path: PathLike) -> Path:
+        """ Normalize a path-like object as a path relative to the root directory. """
         if isinstance(path, str):
             path = Path(path)
         return path.relative_to(ROOT) if path.is_absolute() else path
 
     @staticmethod
     def _split_path(path: Path) -> tuple[str, Path]:
+        """ Split a path into the next name and rest of the path. """
         name, *rest = path.parts
         return name, Path().joinpath(*rest)
 
@@ -410,6 +412,7 @@ class FileTree(collections.abc.MutableMapping[PathLike, typing.Optional[T]]):
                 yield name / descendent
 
     def to_dict(self, serialize=None):
+        """ Convert this tree into a nested dictionary. """
         node = {'elem': serialize(self.element) if serialize else self.element}
         if self.children:
             node['children'] = {name: child.to_dict(serialize=serialize)
@@ -417,7 +420,8 @@ class FileTree(collections.abc.MutableMapping[PathLike, typing.Optional[T]]):
         return node
 
     @classmethod
-    def from_dict(cls, node, deserialize=None) -> 'BackupIncrement':
+    def from_dict(cls, node, deserialize=None) -> 'FileTree':
+        """ Convert a nested dictionary into a tree. """
         element, children = node['elem'], node.get('children') or {}
         return cls(element=(deserialize(element) if deserialize else element),
                    children={name: cls.from_dict(child, deserialize=deserialize)
@@ -464,7 +468,6 @@ class BackupIncrement:
     def metadata_filename(self) -> str:
         return f'{self.fmt_timestamp}-metadata.json'
 
-    @property
     def signature(self) -> str:
         return compute_hash(*(f'{ROOT.joinpath(path)}:{digest}'.encode()
                               for path, digest in self.root.items() if digest))
@@ -574,19 +577,10 @@ class Backup:
     def get_increment(self, signature: bytes) -> typing.Optional[BackupIncrement]:
         if signature and self.last is not None:
             for increment in self.last:
-                if increment.signature == signature:
+                if increment.signature() == signature:
                     return increment
         else:
             return self.last
-
-    def find_tar(self, path: Path, last: typing.Optional[BackupIncrement] = None) \
-            -> typing.Optional[tuple[tarfile.TarInfo, tarfile.TarInfo]]:
-        if last is None:
-            last = self.last
-        for increment in last:
-            tar = self.get_tar(increment, 'r:*')
-            with contextlib.suppress(KeyError):
-                return tar.getmember(str(path))
 
     def extract(self, last: BackupIncrement, file_filter: FileFilter, path: Path) -> int:
         for increment in last:
@@ -598,8 +592,8 @@ class Backup:
             path = ROOT.joinpath(path)
             if not (mounted_path := file_filter.get_mounted_path(path)) or not file_filter(info):
                 return info.size
-            mounted_path, info.name = mounted_path.parent, mounted_path.name
-            tar.extract(info, mounted_path)
+            info.name = mounted_path.name
+            tar.extract(info, path=mounted_path.parent)
             return info.size
         raise ValueError('File not found')
 
@@ -675,8 +669,8 @@ def create(ctx, **options):
             for path, info in infos:
                 increment.add(tar, path, info)
                 bar.update(Path(info.name).name, info.size)
-        signature = increment.signature
-        if increment.prev and increment.prev.signature == signature:
+        signature = increment.signature()
+        if increment.prev and increment.prev.signature() == signature:
             click.secho('No modified files to archive.', fg='yellow', bold=True)
             raise AbortException
         backup.write_metadata(increment.metadata_filename, increment)
@@ -684,6 +678,7 @@ def create(ctx, **options):
         click.secho(f'Backup created (signature: {signature}).', fg='green', bold=True)
 
 
+# TODO: More robust checks (permissions, files that exist, etc), rollbacks
 @cli.command()
 @FileFilter.decorate
 @click.argument('hash', required=False)
@@ -701,8 +696,8 @@ def restore(ctx, **options):
             click.secho(message, fg='red', bold=True)
             return
         file_filter = FileFilter.from_options(**options)
+        paths = list(filter(increment.root.get, increment.root))
         with FileProgressBar(increment.size) as bar:
-            paths = list(filter(increment.root.get, increment.root))
             for path in reversed(paths):
                 size = backup.extract(increment, file_filter, path)
                 bar.update(path.name, size)
@@ -717,7 +712,7 @@ def list_backups(ctx):
             click.secho('Backups:', bold=True)
             for increment in backup.last:
                 columns = [increment.fmt_timestamp, increment.hash_alg,
-                           increment.compression, increment.signature,
+                           increment.compression, increment.signature(),
                            format_file_size(increment.size)]
                 click.echo(f'  {" ".join(columns)}')
         else:
