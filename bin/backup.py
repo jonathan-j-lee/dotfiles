@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+"""
+backup -- A script for creating incremental compressed backups.
+"""
+
 import collections.abc
 import contextlib
 import dataclasses
@@ -9,6 +13,9 @@ import hashlib
 import itertools
 import json
 from pathlib import Path
+import shutil
+import string
+import random
 import re
 import tarfile
 import typing
@@ -22,6 +29,14 @@ BYTE_UNITS: dict[str, int] = {
     'M': (MEGABYTE := 10**6),
     'G': (GIGABYTE := 10**9),
 }
+
+_secho = click.secho
+@functools.wraps(_secho)
+def secho(msg: str, /, *args, prefix: str = '=> ', **kwargs):
+    if kwargs.get('fg') and kwargs.get('bold'):
+        msg = prefix + msg
+    return _secho(msg, *args, **kwargs)
+click.secho = secho
 
 
 def parse_file_size(size: str) -> int:
@@ -80,6 +95,76 @@ def format_duration(duration: datetime.timedelta) -> str:
     seconds, minutes = seconds%60, seconds//60
     minutes, hours = minutes%60, minutes//60
     return '{}:{:0>2}:{:0>2}'.format(hours, minutes, seconds)
+
+
+def random_str(alphabet: str = string.ascii_letters, size: int = 8) -> str:
+    return ''.join(random.choice(alphabet) for _ in range(size))
+
+
+def make_relative(path: Path) -> Path:
+    return path.relative_to(ROOT) if path.is_absolute() else path
+
+
+def filter_prefixes(sources: typing.Iterable[Path]) -> typing.Iterable[Path]:
+    """
+    Filter a list of paths such that no path is a prefix of any other.
+
+    Returns:
+        The filtered paths in sorted order, coerced as absolute paths.
+    """
+    if not (sources := sorted(source.absolute() for source in sources)):
+        return
+    yield (current_path := sources[0])
+    for next_path in sources[1:]:
+        if not next_path.is_relative_to(current_path):
+            yield (current_path := next_path)
+
+
+def make_option_parser(callback, exceptions: tuple[type] = (ValueError,)):
+    @functools.wraps(callback)
+    def wrapper(_ctx, value):
+        try:
+            if isinstance(value, tuple):
+                return tuple(map(callback, value))
+            return callback(value)
+        except exceptions as exc:
+            raise click.BadParameter(repr(value)) from exc
+    return wrapper
+
+
+def parse_permission(permissions: str) -> list[tuple[str, str, str]]:
+    if not (match := re.match(r'^([ugo]+)([\+\-])([rwx]+)$', permissions.lower())):
+        raise ValueError
+    owners, present, actions = match.groups()
+    return [(owner, present, action) for owner in owners for action in actions]
+
+
+@contextlib.contextmanager
+def replace_rollback(path: Path):
+    """ A context manager for possibly replacing a path. """
+    if path.exists():
+        backup_path = path.with_name(f'.backup-{random_str()}-{path.name}')
+        assert not backup_path.exists()
+        try:
+            if not path.is_dir():
+                path.rename(backup_path)
+            yield
+        except:
+            if backup_path.exists():
+                backup_path.rename(path)
+            raise
+        else:
+            backup_path.unlink(missing_ok=True)
+    else:
+        try:
+            yield
+        except:
+            if path.exists():
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+            raise
 
 
 class AbortException(Exception):
@@ -184,33 +269,6 @@ class Mount(typing.NamedTuple):
     def parse(cls, text) -> 'Mount':
         src, dst = text.split(cls.DELIMETER)
         return cls(Path(src), Path(dst) if dst else None)
-
-    def substitute(self, path: Path) -> typing.Optional[Path]:
-        try:
-            suffix = path.relative_to(self.src)
-        except ValueError:
-            return path
-        if self.dst:
-            return self.dst.joinpath(suffix)
-
-
-def make_option_parser(callback, exceptions: tuple[type] = (ValueError,)):
-    @functools.wraps(callback)
-    def wrapper(_ctx, value):
-        try:
-            if isinstance(value, tuple):
-                return tuple(map(callback, value))
-            return callback(value)
-        except exceptions as exc:
-            raise click.BadParameter(repr(value)) from exc
-    return wrapper
-
-
-def parse_permission(permissions: str) -> list[tuple[str, str, str]]:
-    if not (match := re.match(r'^([ugo]+)([\+\-])([rwx]+)$', permissions.lower())):
-        raise ValueError
-    owners, present, actions = match.groups()
-    return [(owner, present, action) for owner in owners for action in actions]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -367,27 +425,20 @@ class FileTree(collections.abc.MutableMapping[PathLike, typing.Optional[T]]):
     children: dict[str, 'FileTree'] = dataclasses.field(default_factory=dict)
 
     @staticmethod
-    def _make_path_relative(path: PathLike) -> Path:
-        """ Normalize a path-like object as a path relative to the root directory. """
-        if isinstance(path, str):
-            path = Path(path)
-        return path.relative_to(ROOT) if path.is_absolute() else path
-
-    @staticmethod
     def _split_path(path: Path) -> tuple[str, Path]:
         """ Split a path into the next name and rest of the path. """
         name, *rest = path.parts
         return name, Path().joinpath(*rest)
 
     def __getitem__(self, path: PathLike) -> T:
-        path = self._make_path_relative(path)
+        path = make_relative(Path(path))
         if not path.parts:
             return self.element
         name, path = self._split_path(path)
         return self.children[name][path]
 
     def __setitem__(self, path: PathLike, element: T):
-        name, path = self._split_path(self._make_path_relative(path))
+        name, path = self._split_path(make_relative(Path(path)))
         if (child := self.children.get(name)) is None:
             child = self.children[name] = FileTree()
         if not path.parts:
@@ -396,7 +447,7 @@ class FileTree(collections.abc.MutableMapping[PathLike, typing.Optional[T]]):
             child[path] = element
 
     def __delitem__(self, path: PathLike):
-        name, path = self._split_path(self._make_path_relative(path))
+        name, path = self._split_path(make_relative(Path(path)))
         if not path.parts:
             del self.children[name]
         else:
@@ -469,24 +520,8 @@ class BackupIncrement:
         return f'{self.fmt_timestamp}-metadata.json'
 
     def signature(self) -> str:
-        return compute_hash(*(f'{ROOT.joinpath(path)}:{digest}'.encode()
+        return compute_hash(*(f'{path}:{digest}'.encode()
                               for path, digest in self.root.items() if digest))
-
-    def scan(self, tar: tarfile.TarFile, file_filter: FileFilter, source: Path) \
-            -> typing.Iterable[tuple[Path, tarfile.TarInfo]]:
-        if mounted_path := file_filter.get_mounted_path(source):
-            info = tar.gettarinfo(source, mounted_path)
-            if file_filter(info):
-                self.size += info.size
-                yield source, info
-                if source.is_dir():
-                    for child in source.iterdir():
-                        yield from self.scan(tar, file_filter, child)
-
-    def scan_chain(self, tar: tarfile.TarFile, file_filter: FileFilter,
-                   *sources: Path) -> list[tarfile.TarInfo]:
-        scans = (self.scan(tar, file_filter, source) for source in filter_prefixes(sources))
-        return list(itertools.chain(*scans))
 
     def get_last_hash(self, path: PathLike) -> typing.Optional[str]:
         if self.prev is not None:
@@ -494,9 +529,9 @@ class BackupIncrement:
                 if digest := increment.root.get(path):
                     return digest
 
-    def add(self, tar: tarfile.TarFile, path: Path, info: tarfile.TarInfo):
+    def add(self, tar: tarfile.TarFile, info: tarfile.TarInfo, path: Path):
         last_hash = self.get_last_hash(path)
-        cm = open(path, 'rb') if path.is_file() else contextlib.nullcontext()
+        cm = path.open('rb') if path.is_file() else contextlib.nullcontext()
         with cm as handle:
             buf = [handle] if handle else []
             digest = compute_hash(info.tobuf(), *buf, hash_alg=self.hash_alg)
@@ -508,13 +543,19 @@ class BackupIncrement:
                     tar.addfile(info)
         self.root[info.name] = digest
 
+    def extract(self, tar: tarfile.TarFile, info: tarfile.TarInfo, path: Path):
+        info.name = path.name
+        tar.extract(info, path=path.parent)
+
+
+ScanResult = typing.Iterable[tuple[tarfile.TarFile, tarfile.TarInfo, Path]]
+
 
 @dataclasses.dataclass
 class Backup:
-    """
-    A backup storage layer for reading and writing metadata and TARs.
-    """
     path: Path
+    file_filter: FileFilter = dataclasses.field(
+        default_factory=functools.partial(FileFilter, file_types={'file', 'dir', 'sym'}))
     stack: contextlib.ExitStack = dataclasses.field(default_factory=contextlib.ExitStack)
     tars: dict[str, tarfile.TarFile] = dataclasses.field(default_factory=dict)
     last: typing.Optional[BackupIncrement] = None
@@ -561,17 +602,25 @@ class Backup:
     def __exit__(self, exc_type, exc, tb) -> bool:
         self.stack.__exit__(exc_type, exc, tb)
         self.last = None
-        if exc_type:
-            for filename, tar in self.tars.items():
-                if tar.mode.startswith('w'):
-                    (self.path / filename).unlink(missing_ok=True)
         return exc_type is AbortException
 
-    def get_tar(self, increment: BackupIncrement, mode: str) -> tarfile.TarFile:
-        tar = self.tars.get(filename := increment.tar_filename)
+    @contextlib.contextmanager
+    def open_tar(self, filename: str, mode: str) -> tarfile.TarFile:
+        """ Open a tar file that is unlinked if an exception occurs while writing. """
+        path = self.path / filename
+        try:
+            with tarfile.open(str(path), mode) as tar:
+                yield tar
+        except:
+            if mode.startswith('w'):
+                path.unlink(missing_ok=True)
+            raise
+
+    def get_tar(self, filename: str, mode: str) -> tarfile.TarFile:
+        tar = self.tars.get((filename, mode))
         if not tar:
-            tar = tarfile.open(str(self.path / filename), mode)
-            tar = self.tars[filename] = self.stack.enter_context(tar)
+            tar = self.open_tar(filename, mode)
+            tar = self.tars[filename, mode] = self.stack.enter_context(tar)
         return tar
 
     def get_increment(self, signature: bytes) -> typing.Optional[BackupIncrement]:
@@ -582,35 +631,39 @@ class Backup:
         else:
             return self.last
 
-    def extract(self, last: BackupIncrement, file_filter: FileFilter, path: Path) -> int:
-        for increment in last:
-            tar = self.get_tar(increment, 'r:*')
-            try:
-                info = tar.getmember(str(path))
-            except KeyError:
-                continue
-            path = ROOT.joinpath(path)
-            if not (mounted_path := file_filter.get_mounted_path(path)) or not file_filter(info):
-                return info.size
-            info.name = mounted_path.name
-            tar.extract(info, path=mounted_path.parent)
-            return info.size
-        raise ValueError('File not found')
+    def _scan_archive(self, increment: BackupIncrement,
+                      path: Path) -> tuple[tarfile.TarFile, tarfile.TarInfo]:
+        name = str(make_relative(path))
+        for current in increment:
+            tar = self.get_tar(increment.tar_filename, 'r:*')
+            with contextlib.suppress(KeyError):
+                return tar, tar.getmember(name)
+        raise ValueError
 
+    def scan_archive(self, increment: BackupIncrement) -> ScanResult:
+        paths = list(map(ROOT.joinpath, filter(increment.root.get, increment.root)))
+        for path in reversed(paths):
+            tar, info = self._scan_archive(increment, path)
+            if (real_path := self.file_filter.get_mounted_path(path)) and self.file_filter(info):
+                yield tar, info, real_path
 
-def filter_prefixes(sources: typing.Iterable[Path]) -> typing.Iterable[Path]:
-    """
-    Filter a list of paths such that no path is a prefix of any other.
+    def _scan_filesystem(self, tar: tarfile.TarFile,
+                         path: Path) -> typing.Iterable[tuple[tarfile.TarInfo, Path]]:
+        if real_path := self.file_filter.get_mounted_path(path):
+            info = tar.gettarinfo(path, real_path)
+            if self.file_filter(info):
+                yield info, path
+                # FIXME: circular links
+                if path.is_dir():
+                    for child in path.iterdir():
+                        yield from self._scan_filesystem(tar, child)
 
-    Returns:
-        The filtered paths in sorted order, coerced as absolute paths.
-    """
-    if not (sources := sorted(source.absolute() for source in sources)):
-        return
-    yield (current_path := sources[0])
-    for next_path in sources[1:]:
-        if not next_path.is_relative_to(current_path):
-            yield (current_path := next_path)
+    def scan_filesystem(self, increment: BackupIncrement, *paths: Path) -> ScanResult:
+        tar = self.get_tar(increment.tar_filename, 'w|' + increment.compression)
+        for path in filter_prefixes(paths):
+            for info, real_path in self._scan_filesystem(tar, path):
+                increment.size += info.size
+                yield tar, info, real_path
 
 
 @click.group(context_settings=dict(max_content_width=100))
@@ -654,21 +707,17 @@ def create(ctx, **options):
     """
     Create a backup.
     """
-    with Backup(ctx.obj['archive']) as backup:
+    with Backup(ctx.obj['archive'], FileFilter.from_options(**options)) as backup:
         increment = backup.push(BackupIncrement(options['hash_alg'], options['compression']))
-        tar = backup.get_tar(increment, 'w|' + increment.compression)
-        file_filter = FileFilter.from_options(**options)
-        infos = increment.scan_chain(tar, file_filter, *options['source'])
-        click.secho(f'Scanned {len(infos)} files ({format_file_size(increment.size)}).',
-                    fg='cyan', bold=True)
-        click.echo(f'Ready to write archive to {increment.tar_filename!r}.')
+        scan = list(backup.scan_filesystem(increment, *options['source']))
+        click.secho(f'Ready to add {len(scan)} files ({format_file_size(increment.size)}) '
+                    f'to {increment.tar_filename!r}.', fg='cyan', bold=True)
         if not click.confirm('Commit to disk?'):
             raise AbortException
-
         with FileProgressBar(increment.size) as bar:
-            for path, info in infos:
-                increment.add(tar, path, info)
-                bar.update(Path(info.name).name, info.size)
+            for tar, info, path in scan:
+                bar.update(path.name, info.size)
+                increment.add(tar, info, path)
         signature = increment.signature()
         if increment.prev and increment.prev.signature() == signature:
             click.secho('No modified files to archive.', fg='yellow', bold=True)
@@ -678,8 +727,9 @@ def create(ctx, **options):
         click.secho(f'Backup created (signature: {signature}).', fg='green', bold=True)
 
 
-# TODO: More robust checks (permissions, files that exist, etc), rollbacks
+# TODO: More robust checks (permissions, files that exist, etc)
 @cli.command()
+@click.option('--rollback/--no-rollback', default=True, help='')
 @FileFilter.decorate
 @click.argument('hash', required=False)
 @click.pass_context
@@ -687,7 +737,7 @@ def restore(ctx, **options):
     """
     Restore a backup.
     """
-    with Backup(ctx.obj['archive']) as backup:
+    with Backup(ctx.obj['archive'], FileFilter.from_options(**options)) as backup:
         if not (increment := backup.get_increment(signature := options['hash'])):
             if signature:
                 message = f'No backup found with signature: {signature!r}.'
@@ -695,12 +745,16 @@ def restore(ctx, **options):
                 message = 'No backups available.'
             click.secho(message, fg='red', bold=True)
             return
-        file_filter = FileFilter.from_options(**options)
-        paths = list(filter(increment.root.get, increment.root))
-        with FileProgressBar(increment.size) as bar:
-            for path in reversed(paths):
-                size = backup.extract(increment, file_filter, path)
-                bar.update(path.name, size)
+        scan = list(backup.scan_archive(increment))
+        size = sum(info.size for _, info, _ in scan)
+        click.secho(f'Ready to extract {len(scan)} files ({format_file_size(size)}).',
+                    fg='cyan', bold=True)
+        if not click.confirm('Commit to disk?'):
+            raise AbortException
+        with FileProgressBar(size) as bar:
+            for tar, info, path in scan:
+                bar.update(path.name, info.size)
+                increment.extract(tar, info, path)
 
 
 @cli.command('list')
@@ -711,9 +765,9 @@ def list_backups(ctx):
         if backup.last is not None:
             click.secho('Backups:', bold=True)
             for increment in backup.last:
-                columns = [increment.fmt_timestamp, increment.hash_alg,
-                           increment.compression, increment.signature(),
-                           format_file_size(increment.size)]
+                columns = [increment.timestamp.isoformat(), increment.hash_alg,
+                           increment.compression, format_file_size(increment.size),
+                           click.style(increment.signature(), fg='blue', bold=True)]
                 click.echo(f'  {" ".join(columns)}')
         else:
             click.secho('No backups found.', fg='yellow', bold=True)
@@ -724,6 +778,8 @@ def list_backups(ctx):
 @click.pass_context
 def remove(ctx):
     """ Remove and merge a backup. """
+    with Backup(ctx.obj['archive']) as backup:
+        pass
 
 
 if __name__ == '__main__':
