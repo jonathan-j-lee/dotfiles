@@ -143,29 +143,25 @@ def parse_permission(permissions: str) -> list[tuple[str, str, str]]:
 @contextlib.contextmanager
 def replace_rollback(path: Path):
     """ A context manager for possibly replacing a path. """
-    if path.exists():
-        backup_path = path.with_name(f'.backup-{random_str()}-{path.name}')
-        assert not backup_path.exists()
-        try:
-            if not path.is_dir():
-                path.rename(backup_path)
-            yield
-        except:
-            if backup_path.exists():
-                backup_path.rename(path)
-            raise
-        else:
-            backup_path.unlink(missing_ok=True)
-    else:
-        try:
-            yield
-        except:
-            if path.exists():
-                if path.is_dir():
-                    shutil.rmtree(path)
+    targets = [parent for parent in [path] + list(path.parents) if not parent.exists()]
+    backup_path = path.with_name(f'.backup-{random_str()}-{path.name}')
+    assert not backup_path.exists()
+    try:
+        if path.exists() and not path.is_dir():
+            path.rename(backup_path)
+        yield
+    except:
+        for target in filter(Path.exists, targets):
+            with contextlib.suppress(PermissionError):
+                if target.is_dir():
+                    shutil.rmtree(target)
                 else:
-                    path.unlink(missing_ok=True)
-            raise
+                    target.unlink(missing_ok=True)
+        if backup_path.exists():
+            backup_path.rename(path)
+        raise
+    else:
+        backup_path.unlink(missing_ok=True)
 
 
 class AbortException(Exception):
@@ -792,6 +788,8 @@ def restore(ctx, **options):
             with FileProgressBar(size) as bar:
                 for tar, info, path in scan:
                     bar.update(path.name, info.size)
+                    if options['rollback']:
+                        backup.stack.enter_context(replace_rollback(path))
                     increment.extract(tar, info, path)
 
 
