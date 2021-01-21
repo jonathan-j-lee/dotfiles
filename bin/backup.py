@@ -30,6 +30,7 @@ BYTE_UNITS: dict[str, int] = {
     'G': (GIGABYTE := 10**9),
 }
 
+
 _secho = click.secho
 @functools.wraps(_secho)
 def secho(msg: str, /, *args, prefix: str = '=> ', **kwargs):
@@ -305,6 +306,7 @@ class FileFilter(typing.Callable[[tarfile.TarInfo], bool]):
         metavar='[YYYY-MM-DDTHH:MM:SS]',
         callback=make_option_parser(datetime.datetime.fromisoformat),
     )
+    FILE_TYPES = ['file', 'dir', 'sym', 'lnk', 'chr', 'blk', 'fifo']
     OPTIONS = [
         click.option('--mount', metavar='[SRC]:[DST]', multiple=True,
                      callback=make_option_parser(Mount.parse), help='Alternate mount points.'),
@@ -314,18 +316,24 @@ class FileFilter(typing.Callable[[tarfile.TarInfo], bool]):
                      callback=make_option_parser(parse_file_size, (ValueError, KeyError)),
                      help='Maximum file size.'),
         click.option('--type', default=['file', 'dir', 'sym'], multiple=True, show_default=True,
-                     type=click.Choice(['file', 'dir', 'sym', 'lnk', 'chr', 'blk', 'fifo']),
-                     help='File types to archive.'),
+                     type=click.Choice(FILE_TYPES), help='File types to archive.'),
         click.option('--user', multiple=True, help='Users owning files to operate on.'),
         click.option('--group', multiple=True, help='Groups owning files to operate on.'),
         click.option('--permission', metavar='[ugo][+-][rwx]', multiple=True,
                      callback=make_option_parser(parse_permission),
-                     help='Permission bit constraints.'),
+                     help='Permission constraints.'),
         _datetime_option('--min-mtime', default=datetime.datetime.min.isoformat(),
                          show_default=True, help='Minimum modified time.'),
         _datetime_option('--max-mtime', default=datetime.datetime.max.isoformat(),
                          show_default=True, help='Maximum modified time.'),
     ]
+
+    @classmethod
+    def get_file_type(cls, info: tarfile.TarInfo) -> str:
+        for file_type in cls.FILE_TYPES:
+            if getattr(info, 'is' + file_type)():
+                return file_type
+        return '?'
 
     @classmethod
     def decorate(cls, fn):
@@ -365,7 +373,7 @@ class FileFilter(typing.Callable[[tarfile.TarInfo], bool]):
         return info.size <= self.max_size
 
     def allow_type(self, info: tarfile.TarInfo) -> bool:
-        return any(getattr(info, f'is{file_type}')() for file_type in self.file_types)
+        return self.get_file_type(info) in self.file_types
 
     def allow_ownership(self, info: tarfile.TarInfo) -> bool:
         return not self.users or info.uname in self.users \
@@ -529,19 +537,20 @@ class BackupIncrement:
                 if digest := increment.root.get(path):
                     return digest
 
-    def add(self, tar: tarfile.TarFile, info: tarfile.TarInfo, path: Path):
-        last_hash = self.get_last_hash(path)
+    def add(self, info: tarfile.TarInfo, path: Path, tar: typing.Optional[tarfile.TarFile] = None) -> bool:
         cm = path.open('rb') if path.is_file() else contextlib.nullcontext()
         with cm as handle:
             buf = [handle] if handle else []
             digest = compute_hash(info.tobuf(), *buf, hash_alg=self.hash_alg)
-            if digest != self.get_last_hash(info.name):
+            modified = digest != self.get_last_hash(info.name)
+            if tar and modified:
                 if handle:
                     handle.seek(0)  # File cache should be warmed up.
                     tar.addfile(info, handle)
                 else:
                     tar.addfile(info)
         self.root[info.name] = digest
+        return modified
 
     def extract(self, tar: tarfile.TarFile, info: tarfile.TarInfo, path: Path):
         info.name = path.name
@@ -635,10 +644,10 @@ class Backup:
                       path: Path) -> tuple[tarfile.TarFile, tarfile.TarInfo]:
         name = str(make_relative(path))
         for current in increment:
-            tar = self.get_tar(increment.tar_filename, 'r:*')
+            tar = self.get_tar(current.tar_filename, 'r:*')
             with contextlib.suppress(KeyError):
                 return tar, tar.getmember(name)
-        raise ValueError
+        raise ValueError(name)
 
     def scan_archive(self, increment: BackupIncrement) -> ScanResult:
         paths = list(map(ROOT.joinpath, filter(increment.root.get, increment.root)))
@@ -691,6 +700,22 @@ def cli(ctx, **options):
         click.confirm = lambda *args, **kwargs: True
 
 
+def render_dry_run(scan: ScanResult, modify_columns=None, indent: int = 2):
+    click.echo()
+    colors = {'file': 'cyan', 'dir': 'blue', 'sym': 'magenta', 'lnk': 'yellow',
+              'chr': 'red', 'blk': 'red', 'fifo': 'yellow'}
+    for _, info, path in scan:
+        file_type = FileFilter.get_file_type(info)
+        fg = colors.get(file_type, 'white')
+        columns = [datetime.datetime.fromtimestamp(int(info.mtime)).isoformat(),
+                   click.style(f'[{file_type.rjust(4)}]', fg=fg, bold=True),
+                   oct(info.mode)[-3:], f'{info.uname}:{info.gname}', str(path)]
+        if modify_columns:
+            modify_columns(info, path, columns)
+        click.echo(' '*indent + ' '.join(columns))
+    click.echo()
+
+
 # TODO: consider encryption/signing archives.
 @cli.command()
 @click.option('--compression', default=BackupIncrement.COMPRESSION_OPTIONS[0],
@@ -712,24 +737,34 @@ def create(ctx, **options):
         scan = list(backup.scan_filesystem(increment, *options['source']))
         click.secho(f'Ready to add {len(scan)} files ({format_file_size(increment.size)}) '
                     f'to {increment.tar_filename!r}.', fg='cyan', bold=True)
-        if not click.confirm('Commit to disk?'):
+        if ctx.obj['dry_run']:
+            def add_status(info: tarfile.TarInfo, path: Path, columns: list[str]):
+                if increment.add(info, path, tar=None):
+                    status = click.style('[added]'.rjust(11), fg='green', bold=True)
+                else:
+                    status = click.style('[no change]', fg='blue', bold=True)
+                columns.insert(0, status)
+            render_dry_run(scan, modify_columns=add_status)
             raise AbortException
-        with FileProgressBar(increment.size) as bar:
-            for tar, info, path in scan:
-                bar.update(path.name, info.size)
-                increment.add(tar, info, path)
-        signature = increment.signature()
-        if increment.prev and increment.prev.signature() == signature:
-            click.secho('No modified files to archive.', fg='yellow', bold=True)
-            raise AbortException
-        backup.write_metadata(increment.metadata_filename, increment)
-        click.echo(f'Wrote metadata to {increment.metadata_filename!r}.')
-        click.secho(f'Backup created (signature: {signature}).', fg='green', bold=True)
+        else:
+            if not click.confirm('Commit to disk?'):
+                raise AbortException
+            with FileProgressBar(increment.size) as bar:
+                for tar, info, path in scan:
+                    bar.update(path.name, info.size)
+                    increment.add(info, path, tar=tar)
+            signature = increment.signature()
+            if increment.prev and increment.prev.signature() == signature:
+                click.secho('No modified files to archive.', fg='yellow', bold=True)
+                raise AbortException
+            backup.write_metadata(increment.metadata_filename, increment)
+            click.secho(f'Backup created (signature: {signature}).', fg='green', bold=True)
 
 
 # TODO: More robust checks (permissions, files that exist, etc)
 @cli.command()
 @click.option('--rollback/--no-rollback', default=True, help='')
+@click.option('--overwrite/--no-overwrite', default=True, help='')
 @FileFilter.decorate
 @click.argument('hash', required=False)
 @click.pass_context
@@ -749,12 +784,15 @@ def restore(ctx, **options):
         size = sum(info.size for _, info, _ in scan)
         click.secho(f'Ready to extract {len(scan)} files ({format_file_size(size)}).',
                     fg='cyan', bold=True)
-        if not click.confirm('Commit to disk?'):
-            raise AbortException
-        with FileProgressBar(size) as bar:
-            for tar, info, path in scan:
-                bar.update(path.name, info.size)
-                increment.extract(tar, info, path)
+        if ctx.obj['dry_run']:
+            render_dry_run(scan)
+        else:
+            if not click.confirm('Commit to disk?'):
+                raise AbortException
+            with FileProgressBar(size) as bar:
+                for tar, info, path in scan:
+                    bar.update(path.name, info.size)
+                    increment.extract(tar, info, path)
 
 
 @cli.command('list')
