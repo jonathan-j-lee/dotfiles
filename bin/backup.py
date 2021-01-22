@@ -34,7 +34,7 @@ BYTE_UNITS: dict[str, int] = {
 _secho = click.secho
 @functools.wraps(_secho)
 def secho(msg: str, /, *args, prefix: str = '=> ', **kwargs):
-    if kwargs.get('fg') and kwargs.get('bold'):
+    if kwargs.get('bold'):
         msg = prefix + msg
     return _secho(msg, *args, **kwargs)
 click.secho = secho
@@ -607,7 +607,10 @@ class Backup:
     def __exit__(self, exc_type, exc, tb) -> bool:
         self.stack.__exit__(exc_type, exc, tb)
         self.last = None
-        return exc_type is AbortException
+        if exc_type in (AbortException, KeyboardInterrupt):
+            click.secho('Aborting operation.', fg='red', bold=True)
+            return True
+        return False
 
     @contextlib.contextmanager
     def open_tar(self, filename: str, mode: str) -> tarfile.TarFile:
@@ -675,9 +678,9 @@ class Backup:
 @click.option('--archive', default=str(Path.cwd()), callback=make_option_parser(Path),
               type=click.Path(file_okay=False, exists=True),
               help='Directory to write the backups to.')
-@click.option('--confirm/--no-confirm', default=True,
+@click.option('--confirm/--no-confirm', default=True, show_default=True,
               help='Toggle confirmation of critical tasks.')
-@click.option('--dry-run', is_flag=True, help='Do not persist changes.')
+@click.option('--dry-run', is_flag=True, show_default=True, help='Do not persist changes.')
 @click.version_option(version='1.0.0', message='v%(version)s')
 @click.pass_context
 def cli(ctx, **options):
@@ -757,10 +760,24 @@ def create(ctx, **options):
             click.secho(f'Backup created (signature: {signature}).', fg='green', bold=True)
 
 
-# TODO: More robust checks (permissions, files that exist, etc)
+def check_overwrite(scan: ScanResult):
+    click.secho('Checking if files exist (overwrite disabled) ...')
+    paths = [path for _, _, path in scan if path.exists() and path.is_file()]
+    if paths:
+        click.secho('One or more files already exist and would be overwritten:',
+                    fg='red', bold=True)
+        for path in paths:
+            click.echo(' '*2 + str(path))
+        raise AbortException
+    else:
+        click.secho('No files will be overwritten.', fg='green', bold=True)
+
+
 @cli.command()
-@click.option('--rollback/--no-rollback', default=True, help='')
-@click.option('--overwrite/--no-overwrite', default=True, help='')
+@click.option('--rollback/--no-rollback', default=True, show_default=True,
+              help='Make this operation atomic.')
+@click.option('--overwrite/--no-overwrite', default=False, show_default=True,
+              help='Enable overwriting existing files.')
 @FileFilter.decorate
 @click.argument('hash', required=False)
 @click.pass_context
@@ -775,7 +792,7 @@ def restore(ctx, **options):
             else:
                 message = 'No backups available.'
             click.secho(message, fg='red', bold=True)
-            return
+            raise AbortException
         scan = list(backup.scan_archive(increment))
         size = sum(info.size for _, info, _ in scan)
         click.secho(f'Ready to extract {len(scan)} files ({format_file_size(size)}).',
@@ -783,6 +800,8 @@ def restore(ctx, **options):
         if ctx.obj['dry_run']:
             render_dry_run(scan)
         else:
+            if not options['overwrite']:
+                check_overwrite(scan)
             if not click.confirm('Commit to disk?'):
                 raise AbortException
             with FileProgressBar(size) as bar:
