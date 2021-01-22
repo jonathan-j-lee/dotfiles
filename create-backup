@@ -1,12 +1,24 @@
 #!/bin/bash
 
+archive=/run/media/jonathanlee/94726526-8fef-49c1-958f-aa3fd8cec49b
+if [ ! -d "${archive}" ]; then
+  echo "Archive not found: ${archive}" >/dev/stderr
+  echo "Remember to open and mount the drive." >/dev/stderr
+  exit 1
+fi
+
+userhome=/home/jonathanlee
 set -x
-bin/backup.py --archive /tmp/archive create $@ \
+backup --dry-run --archive "${archive}" create \
   --compression=gz \
   --exclude=__pycache__ \
   --exclude=*.pyc \
-  --exclude=.v*env* \
+  --exclude=venv* \
+  --exclude=virtualenv* \
+  --exclude=.venv* \
+  --exclude=.virtualenv* \
   --exclude=node_modules \
+  --exclude=.npm \
   --exclude=.cache \
   --exclude=.vagrant \
   --exclude=*.synctex* \
@@ -17,8 +29,13 @@ bin/backup.py --archive /tmp/archive create $@ \
   --exclude=*.fdb_latexmk \
   --exclude=*.pdfsync \
   --exclude=*.toc \
-  --mount ${HOME}:/ \
-  --mount ${HOME}/uc-berkeley/2016-fall/math-53: \
-  ~/uc-berkeley/2016-fall \
-  /var/log/pacman.log \
-  ~/uc-berkeley/2016-fall/cs-61a
+  --exclude=.atom/.apm \
+  --exclude=.atom/compile-cache \
+  --exclude=.pyenv \
+  --exclude=.rvm \
+  --exclude=.gem \
+  --exclude=.gradle \
+  --exclude=.node-gyp \
+  --mount "${userhome}:/home" \
+  "${userhome}" \
+  /var/log/pacman.log

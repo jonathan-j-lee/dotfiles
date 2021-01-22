@@ -2,6 +2,12 @@
 
 """
 backup -- A script for creating incremental compressed backups.
+
+TODO:
+  * Consider encrypting/signing archives.
+  * Integrity check using ``filecmp``.
+  * Better error handling.
+  * Better logging (ex: show skipped files).
 """
 
 import collections.abc
@@ -607,8 +613,10 @@ class Backup:
     def __exit__(self, exc_type, exc, tb) -> bool:
         self.stack.__exit__(exc_type, exc, tb)
         self.last = None
+        message = 'interrupted' if exc_type is KeyboardInterrupt else str(exc)
         if exc_type in (AbortException, KeyboardInterrupt):
-            click.secho('Aborting operation.', fg='red', bold=True)
+            if message:
+                click.secho(f'Operation aborted: {message}', fg='red', bold=True)
             return True
         return False
 
@@ -661,7 +669,7 @@ class Backup:
             info = tar.gettarinfo(path, real_path)
             if self.file_filter(info):
                 yield info, path
-                # FIXME: circular links
+                # FIXME: circular links might not work
                 if path.is_dir():
                     for child in path.iterdir():
                         yield from self._scan_filesystem(tar, child)
@@ -715,7 +723,6 @@ def render_dry_run(scan: ScanResult, modify_columns=None, indent: int = 2):
     click.echo()
 
 
-# TODO: consider encryption/signing archives.
 @cli.command()
 @click.option('--compression', default=BackupIncrement.COMPRESSION_OPTIONS[0],
               show_default=True, type=click.Choice(BackupIncrement.COMPRESSION_OPTIONS),
@@ -786,19 +793,23 @@ def restore(ctx, **options):
     Restore a backup.
     """
     with Backup(ctx.obj['archive'], FileFilter.from_options(**options)) as backup:
-        if not (increment := backup.get_increment(signature := options['hash'])):
+        if (increment := backup.get_increment(signature := options['hash'])) is None:
             if signature:
-                message = f'No backup found with signature: {signature!r}.'
+                raise AbortException(f'No backup found with signature: {signature!r}')
             else:
-                message = 'No backups available.'
-            click.secho(message, fg='red', bold=True)
-            raise AbortException
+                raise AbortException(f'No backups available.')
         scan = list(backup.scan_archive(increment))
         size = sum(info.size for _, info, _ in scan)
         click.secho(f'Ready to extract {len(scan)} files ({format_file_size(size)}).',
                     fg='cyan', bold=True)
         if ctx.obj['dry_run']:
-            render_dry_run(scan)
+            def check_path(_info, path, columns):
+                if path.exists():
+                    status = click.style('[exists]', fg='red', bold=True)
+                else:
+                    status = click.style('[ok]'.rjust(7), fg='green', bold=True)
+                columns.insert(0, status)
+            render_dry_run(scan, modify_columns=check_path)
         else:
             if not options['overwrite']:
                 check_overwrite(scan)
@@ -815,7 +826,9 @@ def restore(ctx, **options):
 @cli.command('list')
 @click.pass_context
 def list_backups(ctx):
-    """ List available backups. """
+    """
+    List available backups.
+    """
     with Backup(ctx.obj['archive']) as backup:
         if backup.last is not None:
             click.secho('Backups:', bold=True)
@@ -829,12 +842,53 @@ def list_backups(ctx):
 
 
 @cli.command()
+@click.option('--hide/--no-hide', default=True, show_default=True,
+              help='Hide files with no change.')
+@click.argument('prev')
+@click.argument('next')
+@click.pass_context
+def diff(ctx, **options):
+    """
+    Compare files between two backups.
+    """
+    with Backup(ctx.obj['archive']) as backup:
+        prev_inc = backup.get_increment(prev_sig := options['prev'])
+        next_inc = backup.get_increment(next_sig := options['next'])
+        if prev_inc is None:
+            raise AbortException(f'No backup found with signature: {prev_sig!r}')
+        if next_inc is None:
+            raise AbortException(f'No backup found with signature: {next_sig!r}')
+        click.secho('File hashes:', bold=True)
+        click.echo()
+        for path in sorted(set(prev_inc.root) | set(next_inc.root)):
+            prev_hash = prev_inc.root.get(path, 'none')
+            next_hash = next_inc.root.get(path, 'none')
+            changed = prev_hash != next_hash
+            if options['hide'] and not changed:
+                continue
+            message = ' '*2 + (prev_hash or 'none') + ' ' + next_hash
+            path_repr = str(ROOT.joinpath(path))
+            if changed:
+                if prev_hash == 'none':
+                    fg = 'green'
+                elif next_hash == 'none':
+                    fg = 'red'
+                else:
+                    fg = 'cyan'
+                path_repr = click.style(path_repr, fg=fg, bold=True)
+            click.secho(message + ' ' + path_repr)
+        click.echo()
+
+
+@cli.command()
 @click.argument('hash', required=False)
 @click.pass_context
-def remove(ctx):
-    """ Remove and merge a backup. """
+def remove(ctx, **options):
+    """
+    Remove and merge a backup.
+    """
     with Backup(ctx.obj['archive']) as backup:
-        pass
+        raise AbortException('not implemented')
 
 
 if __name__ == '__main__':
