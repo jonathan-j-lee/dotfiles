@@ -16,7 +16,6 @@ import dataclasses
 import datetime
 import functools
 import hashlib
-import itertools
 import json
 from pathlib import Path
 import shutil
@@ -24,6 +23,7 @@ import string
 import random
 import re
 import tarfile
+import tempfile
 import typing
 
 import click
@@ -228,7 +228,7 @@ class FileProgressBar:
             fg = 'yellow'
         else:
             fg = 'green'
-        return click.style(format_file_size(rate) + '/s', fg=fg, bold=True)
+        return click.style(format_file_size(rate) + '/s', fg=f'bright_{fg}', bold=True)
 
     @property
     def eta(self) -> datetime.timedelta:
@@ -252,7 +252,7 @@ class FileProgressBar:
         percentage = '{:.1f}%'.format(100*self.progress).rjust(5)
 
         rate = self.update_rate(size)
-        filename = click.style(name, fg='cyan', bold=True)
+        filename = click.style(name, fg='bright_cyan', bold=True)
         if size > 0:
             filename += f' ({format_file_size(size)})'
         click.echo(' | '.join([
@@ -490,7 +490,7 @@ class FileTree(collections.abc.MutableMapping[PathLike, typing.Optional[T]]):
 
 
 @dataclasses.dataclass
-class BackupIncrement:
+class BackupIncrement(collections.abc.Sequence['BackupIncrement']):
     HASH_ALGORITHMS = ('sha256', 'sha384', 'sha512')
     COMPRESSION_OPTIONS = ('none', 'gz', 'bz2', 'xz')
     TIMESTAMP_FORMAT = '%Y-%m-%dT%H%M%S'
@@ -502,16 +502,27 @@ class BackupIncrement:
         dataclasses.field(default_factory=datetime.datetime.utcnow)
     size: int = 0
     root: FileTree[typing.ByteString] = dataclasses.field(default_factory=FileTree)
-    prev: typing.Optional['BackupIncrement'] = None
+    prev: typing.Optional['BackupIncrement'] = dataclasses.field(
+        default=None, repr=False, compare=False)
+    next: typing.Optional['BackupIncrement'] = dataclasses.field(
+        default=None, repr=False, compare=False)
 
     def __post_init__(self):
         if self.compression == 'none':
             self.compression = ''
 
     def __iter__(self) -> typing.Iterable['BackupIncrement']:
-        yield self
-        if self.prev:
-            yield from self.prev
+        current = self
+        while current is not None:
+            yield current
+            current = current.prev
+
+    def __getitem__(self, index: int) -> 'BackupIncrement':
+        current = self
+        for _ in range(index):
+            if (current := current.prev) is None:
+                raise IndexError
+        return current
 
     def __len__(self) -> int:
         return 1 + (0 if self.prev is None else len(self.prev))
@@ -530,8 +541,9 @@ class BackupIncrement:
         return f'{self.fmt_timestamp}-metadata.json'
 
     def signature(self) -> str:
-        return compute_hash(*(f'{path}:{digest}'.encode()
-                              for path, digest in self.root.items() if digest))
+        encoded_paths = (f'{path}:{digest}'.encode()
+                         for path, digest in self.root.items() if digest)
+        return compute_hash(self.fmt_timestamp.encode(), *encoded_paths)
 
     def get_last_hash(self, path: PathLike) -> typing.Optional[str]:
         if self.prev is not None:
@@ -539,13 +551,14 @@ class BackupIncrement:
                 if digest := increment.root.get(path):
                     return digest
 
-    def add(self, info: tarfile.TarInfo, path: Path, tar: typing.Optional[tarfile.TarFile] = None) -> bool:
+    def add(self, info: tarfile.TarInfo, path: Path,
+            tar: typing.Optional[tarfile.TarFile] = None, force: bool = False) -> bool:
         cm = path.open('rb') if path.is_file() else contextlib.nullcontext()
         with cm as handle:
             buf = [handle] if handle else []
             digest = compute_hash(info.tobuf(), *buf, hash_alg=self.hash_alg)
             modified = digest != self.get_last_hash(info.name)
-            if tar and modified:
+            if force or (tar and modified):
                 if handle:
                     handle.seek(0)  # File cache should be warmed up.
                     tar.addfile(info, handle)
@@ -599,6 +612,8 @@ class Backup:
 
     def push(self, increment: BackupIncrement) -> BackupIncrement:
         """ Push a new backup increment into the history. """
+        if self.last is not None:
+            self.last.next = increment
         self.last, increment.prev = increment, self.last
         return increment
 
@@ -616,7 +631,7 @@ class Backup:
         message = 'interrupted' if exc_type is KeyboardInterrupt else str(exc)
         if exc_type in (AbortException, KeyboardInterrupt):
             if message:
-                click.secho(f'Operation aborted: {message}', fg='red', bold=True)
+                click.secho(f'Operation aborted: {message}', fg='bright_red', bold=True)
             return True
         return False
 
@@ -647,8 +662,8 @@ class Backup:
         else:
             return self.last
 
-    def _scan_archive(self, increment: BackupIncrement,
-                      path: Path) -> tuple[tarfile.TarFile, tarfile.TarInfo]:
+    def _scan_archives(self, increment: BackupIncrement,
+                       path: Path) -> tuple[tarfile.TarFile, tarfile.TarInfo]:
         name = str(make_relative(path))
         for current in increment:
             tar = self.get_tar(current.tar_filename, 'r:*')
@@ -656,12 +671,23 @@ class Backup:
                 return tar, tar.getmember(name)
         raise ValueError(name)
 
-    def scan_archive(self, increment: BackupIncrement) -> ScanResult:
+    def scan_archives(self, increment: BackupIncrement) -> ScanResult:
         paths = list(map(ROOT.joinpath, filter(increment.root.get, increment.root)))
         for path in reversed(paths):
-            tar, info = self._scan_archive(increment, path)
+            tar, info = self._scan_archives(increment, path)
             if (real_path := self.file_filter.get_mounted_path(path)) and self.file_filter(info):
                 yield tar, info, real_path
+
+    def scan_archive(self, increment: BackupIncrement, check_neighbors: bool = True) -> ScanResult:
+        tar = self.get_tar(increment.tar_filename, 'r:*')
+        for info in tar:
+            if check_neighbors:
+                digest = increment.root.get(info.name)
+                if increment.next is not None and digest != increment.next.root.get(info.name):
+                    continue
+                if increment.prev is not None and digest == increment.prev.root.get(info.name):
+                    continue
+            yield tar, info, Path(info.name)
 
     def _scan_filesystem(self, tar: tarfile.TarFile,
                          path: Path) -> typing.Iterable[tuple[tarfile.TarInfo, Path]]:
@@ -680,6 +706,17 @@ class Backup:
             for info, real_path in self._scan_filesystem(tar, path):
                 increment.size += info.size
                 yield tar, info, real_path
+
+    def remove(self, increment: BackupIncrement, tmp: PathLike):
+        target_tar_path = self.path / increment.next.tar_filename
+        paths = [
+            self.path / increment.tar_filename,
+            self._metadata_path / increment.metadata_filename,
+            target_tar_path,
+        ]
+        for path in paths:
+            self.stack.enter_context(replace_rollback(path))
+        Path(tmp).rename(target_tar_path)
 
 
 @click.group(context_settings=dict(max_content_width=100))
@@ -713,7 +750,7 @@ def render_dry_run(scan: ScanResult, modify_columns=None, indent: int = 2):
               'chr': 'red', 'blk': 'red', 'fifo': 'yellow'}
     for _, info, path in scan:
         file_type = FileFilter.get_file_type(info)
-        fg = colors.get(file_type, 'white')
+        fg = 'bright_' + colors.get(file_type, 'white')
         columns = [datetime.datetime.fromtimestamp(int(info.mtime)).isoformat(),
                    click.style(f'[{file_type.rjust(4)}]', fg=fg, bold=True),
                    oct(info.mode)[-3:], f'{info.uname}:{info.gname}', str(path)]
@@ -742,13 +779,13 @@ def create(ctx, **options):
         increment = backup.push(BackupIncrement(options['hash_alg'], options['compression']))
         scan = list(backup.scan_filesystem(increment, *options['source']))
         click.secho(f'Ready to add {len(scan)} files ({format_file_size(increment.size)}) '
-                    f'to {increment.tar_filename!r}.', fg='cyan', bold=True)
+                    f'to {increment.tar_filename!r}.', fg='bright_cyan', bold=True)
         if ctx.obj['dry_run']:
             def add_status(info: tarfile.TarInfo, path: Path, columns: list[str]):
                 if increment.add(info, path, tar=None):
-                    status = click.style('[added]'.rjust(11), fg='green', bold=True)
+                    status = click.style('[added]'.rjust(11), fg='bright_green', bold=True)
                 else:
-                    status = click.style('[no change]', fg='blue', bold=True)
+                    status = click.style('[no change]', fg='bright_blue', bold=True)
                 columns.insert(0, status)
             render_dry_run(scan, modify_columns=add_status)
             raise AbortException
@@ -759,12 +796,12 @@ def create(ctx, **options):
                 for tar, info, path in scan:
                     bar.update(path.name, info.size)
                     increment.add(info, path, tar=tar)
-            signature = increment.signature()
-            if increment.prev and increment.prev.signature() == signature:
-                click.secho('No modified files to archive.', fg='yellow', bold=True)
+            if increment.prev is not None and increment.prev.root == increment.root:
+                click.secho('No modified files to archive.', fg='bright_yellow', bold=True)
                 raise AbortException
             backup.write_metadata(increment.metadata_filename, increment)
-            click.secho(f'Backup created (signature: {signature}).', fg='green', bold=True)
+            click.secho(f'Backup created (signature: {increment.signature()}).',
+                        fg='bright_green', bold=True)
 
 
 def check_overwrite(scan: ScanResult):
@@ -772,12 +809,12 @@ def check_overwrite(scan: ScanResult):
     paths = [path for _, _, path in scan if path.exists() and path.is_file()]
     if paths:
         click.secho('One or more files already exist and would be overwritten:',
-                    fg='red', bold=True)
+                    fg='bright_red', bold=True)
         for path in paths:
             click.echo(' '*2 + str(path))
         raise AbortException
     else:
-        click.secho('No files will be overwritten.', fg='green', bold=True)
+        click.secho('No files will be overwritten.', fg='bright_green', bold=True)
 
 
 @cli.command()
@@ -798,16 +835,16 @@ def restore(ctx, **options):
                 raise AbortException(f'No backup found with signature: {signature!r}')
             else:
                 raise AbortException(f'No backups available.')
-        scan = list(backup.scan_archive(increment))
+        scan = list(backup.scan_archives(increment))
         size = sum(info.size for _, info, _ in scan)
         click.secho(f'Ready to extract {len(scan)} files ({format_file_size(size)}).',
-                    fg='cyan', bold=True)
+                    fg='bright_cyan', bold=True)
         if ctx.obj['dry_run']:
             def check_path(_info, path, columns):
                 if path.exists():
-                    status = click.style('[exists]', fg='red', bold=True)
+                    status = click.style('[exists]', fg='bright_red', bold=True)
                 else:
-                    status = click.style('[ok]'.rjust(7), fg='green', bold=True)
+                    status = click.style('[ok]'.rjust(7), fg='bright_green', bold=True)
                 columns.insert(0, status)
             render_dry_run(scan, modify_columns=check_path)
         else:
@@ -833,12 +870,15 @@ def list_backups(ctx):
         if backup.last is not None:
             click.secho('Backups:', bold=True)
             for increment in backup.last:
+                file_count = sum(1 for path in increment.root if increment.root[path])
                 columns = [increment.timestamp.isoformat(), increment.hash_alg,
-                           increment.compression, format_file_size(increment.size),
-                           click.style(increment.signature(), fg='blue', bold=True)]
+                           increment.compression or 'none',
+                           format_file_size(increment.size).rjust(8),
+                           click.style(increment.signature(), fg='bright_blue', bold=True),
+                           '{:>6} members'.format(file_count)]
                 click.echo(f'  {" ".join(columns)}')
         else:
-            click.secho('No backups found.', fg='yellow', bold=True)
+            click.secho('No backups found.', fg='bright_yellow', bold=True)
 
 
 @cli.command()
@@ -861,34 +901,66 @@ def diff(ctx, **options):
         click.secho('File hashes:', bold=True)
         click.echo()
         for path in sorted(set(prev_inc.root) | set(next_inc.root)):
-            prev_hash = prev_inc.root.get(path, 'none')
-            next_hash = next_inc.root.get(path, 'none')
+            prev_hash = prev_inc.root.get(path)
+            next_hash = next_inc.root.get(path)
             changed = prev_hash != next_hash
             if options['hide'] and not changed:
                 continue
-            message = ' '*2 + (prev_hash or 'none') + ' ' + next_hash
+            message = ' '*2 + str(prev_hash) + ' ' + str(next_hash)
             path_repr = str(ROOT.joinpath(path))
             if changed:
-                if prev_hash == 'none':
+                if not prev_hash:
                     fg = 'green'
-                elif next_hash == 'none':
+                elif not next_hash:
                     fg = 'red'
                 else:
                     fg = 'cyan'
-                path_repr = click.style(path_repr, fg=fg, bold=True)
+                path_repr = click.style(path_repr, fg=f'bright_{fg}', bold=True)
             click.secho(message + ' ' + path_repr)
         click.echo()
 
 
 @cli.command()
-@click.argument('hash', required=False)
+@click.argument('hash')
 @click.pass_context
 def remove(ctx, **options):
     """
     Remove and merge a backup.
     """
     with Backup(ctx.obj['archive']) as backup:
-        raise AbortException('not implemented')
+        if (increment := backup.get_increment(signature := options['hash'])) is None:
+            if signature:
+                raise AbortException(f'No backup found with signature: {signature!r}')
+            else:
+                raise AbortException(f'No backups available.')
+        if increment.next is None:
+            raise AbortException('Cannot remove the latest backup.')
+        scan = list(backup.scan_archive(increment))
+        scan.extend(backup.scan_archive(increment.next, check_neighbors=False))
+        size = sum(info.size for _, info, _ in scan)
+        click.secho(f'Ready to transfer {len(scan)} files ({format_file_size(size)}) '
+                    f'from {increment.tar_filename!r} to {increment.next.tar_filename!r}.',
+                    fg='bright_cyan', bold=True)
+        if ctx.obj['dry_run']:
+            render_dry_run(scan)
+        else:
+            if not click.confirm('Commit to disk?'):
+                raise AbortException
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                backup.stack.callback(lambda: Path(tmp.name).unlink(missing_ok=True))
+                with (tarfile.open(mode='w|' + increment.next.compression, fileobj=tmp) as target_tar,
+                        tempfile.TemporaryDirectory() as tmp_root, FileProgressBar(size) as bar):
+                    for source_tar, info, tar_path in scan:
+                        real_path = Path(tmp_root).joinpath(tar_path)
+                        bar.update(real_path.name, info.size)
+                        increment.extract(source_tar, info, real_path)
+                        info = target_tar.gettarinfo(real_path, tar_path)
+                        increment.next.add(info, real_path, tar=target_tar, force=True)
+                        if not info.isdir():
+                            real_path.unlink(missing_ok=True)
+            backup.remove(increment, tmp.name)
+            click.secho(f'Backup removed (signature: {increment.signature()}).',
+                        fg='red', bold=True)
 
 
 if __name__ == '__main__':

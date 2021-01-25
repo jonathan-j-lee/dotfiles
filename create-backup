@@ -1,6 +1,7 @@
 #!/bin/bash
 
-archive=/run/media/jonathanlee/94726526-8fef-49c1-958f-aa3fd8cec49b
+#archive=/run/media/jonathanlee/94726526-8fef-49c1-958f-aa3fd8cec49b
+archive=/tmp/archive
 if [ ! -d "${archive}" ]; then
   echo "Archive not found: ${archive}" >/dev/stderr
   echo "Remember to open and mount the drive." >/dev/stderr
@@ -9,33 +10,37 @@ fi
 
 userhome=/home/jonathanlee
 set -x
-backup --dry-run --archive "${archive}" create \
-  --compression=gz \
-  --exclude=__pycache__ \
-  --exclude=*.pyc \
-  --exclude=venv* \
-  --exclude=virtualenv* \
-  --exclude=.venv* \
-  --exclude=.virtualenv* \
-  --exclude=node_modules \
-  --exclude=.npm \
-  --exclude=.cache \
-  --exclude=.vagrant \
-  --exclude=*.synctex* \
-  --exclude=.DS_Store \
-  --exclude=*.aux \
-  --exclude=*.lof \
-  --exclude=*.fls \
-  --exclude=*.fdb_latexmk \
-  --exclude=*.pdfsync \
-  --exclude=*.toc \
-  --exclude=.atom/.apm \
-  --exclude=.atom/compile-cache \
-  --exclude=.pyenv \
-  --exclude=.rvm \
-  --exclude=.gem \
-  --exclude=.gradle \
-  --exclude=.node-gyp \
+time bin/backup.py --dry-run --archive "${archive}" create \
+  --compression gz \
+  --exclude __pycache__ \
+  --exclude '*.pyc' \
+  --exclude 'venv*' \
+  --exclude 'virtualenv*' \
+  --exclude '.venv*' \
+  --exclude '.virtualenv*' \
+  --exclude node_modules \
+  --exclude .npm \
+  --exclude '*[Cc]ache*' \
+  --exclude .vagrant \
+  --exclude '*.synctex*' \
+  --exclude .DS_Store \
+  --exclude '*.aux' \
+  --exclude '*.lof' \
+  --exclude '*.fls' \
+  --exclude '*.fdb_latexmk' \
+  --exclude '*.pdfsync' \
+  --exclude '*.toc' \
+  --exclude .atom/.apm \
+  --exclude .atom/compile-cache \
+  --exclude .pyenv \
+  --exclude .rvm \
+  --exclude .rbenv \
+  --exclude .gem \
+  --exclude .gradle \
+  --exclude .node-gyp \
+  --exclude .local \
+  --exclude _site \
+  --exclude .cargo \
   --mount "${userhome}:/home" \
   "${userhome}" \
   /var/log/pacman.log
